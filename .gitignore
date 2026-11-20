@@ -1,0 +1,21 @@
+# Variables de entorno y credenciales (NUNCA subir a GitHub)
+.env
+*.env
+
+# Entorno virtual y archivos compilados de Python
+.venv/
+venv/
+__pycache__/
+*.py[cod]
+*$py.class
+
+# Caché local del agente y salidas generadas
+.cache_qa/
+salidas/
+
+# Archivos temporales de Microsoft Word
+~$*
+
+# Archivos de sistema o editor
+.DS_Store
+Thumbs.db

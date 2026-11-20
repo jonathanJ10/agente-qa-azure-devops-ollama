@@ -1,0 +1,386 @@
+import json
+import re
+from pathlib import Path
+
+from azure_devops_cliente import AzureDevOpsCliente, formatear_work_item
+from cache_qa import calcular_clave_cache, guardar_cache_qa, leer_cache_qa
+from exportador_word import exportar_qa_a_word
+from guardrails_qa import guardar_docx_seguro, normalizar_y_validar_qa
+from lector_archivos import leer_archivo_requerimiento
+from llm_cliente import extraer_json, preguntar_llm
+from motor_rag import recuperar_contexto_rag
+from observabilidad_evals import (
+    TimerEjecucion,
+    evaluar_cobertura_criterios,
+    registrar_metricas_ejecucion,
+)
+
+MODELO_OLLAMA = "llama3"
+
+SYSTEM_PROMPT_QA = """
+Eres un Arquitecto y Analista Senior de QA especializado en ingeniería de software y arquitectura agéntica.
+Tu trabajo es analizar requerimientos de negocio y generar artefactos de calidad completos, exhaustivos y accionables, siguiendo estrictamente las políticas internas de QA proporcionadas en el contexto RAG y los criterios de aceptación del requerimiento.
+
+Debes responder ÚNICAMENTE con un objeto JSON válido (sin markdown extra ni texto fuera del JSON) con esta estructura exacta:
+{
+  "refinamiento": {
+    "observaciones_criticas": ["..."],
+    "preguntas_escalamiento": ["..."]
+  },
+  "historias_de_usuario": [
+    {
+      "id": "HU-01",
+      "titulo": "...",
+      "descripcion": "Como [rol], quiero [acción], para [beneficio]",
+      "criterios_aceptacion": ["..."]
+    }
+  ],
+  "casos_de_prueba": {
+    "humo": [
+      {"id": "SMK-01", "escenario": "...", "resultado_esperado": "..."}
+    ],
+    "funcionales": [
+      {"id": "FNC-01", "escenario": "...", "resultado_esperado": "..."}
+    ],
+    "regresion": [
+      {"id": "REG-01", "escenario": "...", "resultado_esperado": "..."}
+    ],
+    "automatizacion": [
+      {"id": "AUT-01", "escenario": "...", "candidato_porque": "...", "resultado_esperado": "..."}
+    ]
+  }
+}
+
+Reglas obligatorias de desglose y cobertura:
+1. Analiza SIEMPRE tanto la "Descripción" como los "Criterios de aceptación". Si los "Criterios de aceptación" incluyen categorías/módulos y subopciones con guiones ("- ..."), NO las resumas ni las omitas: genera un caso funcional por CADA subopción.
+2. Redacta cada caso funcional de forma clara y explícita siguiendo este estilo:
+   "Se debe validar que la subopción [nombre de la subopción] esté funcional en el sistema (dentro de [categoría/módulo si aplica])."
+   Si una subopción tiene una condición especial (como "(aplica unicamente PSE)"), inclúyela en el escenario y en el resultado esperado.
+3. En "casos_de_prueba.humo": genera entre 2 y 3 casos verificando disponibilidad del módulo, acceso y carga inicial sin errores.
+4. En "casos_de_prueba.regresion": genera entre 2 y 3 casos verificando que no haya afectación en otros módulos, proyectos/OT de referencia ni pérdida de consistencia de datos.
+5. En "casos_de_prueba.automatizacion": genera entre 2 y 3 casos priorizando pruebas repetitivas, de regresión o validación de reportes/reglas críticas, explicando en "candidato_porque" el motivo técnico concreto.
+"""
+
+
+def _extraer_subopciones_criterios(contenido_req: str) -> list[tuple[str, str]]:
+    """Extrae pares (categoria, subopcion) a partir del bloque de Criterios de aceptación."""
+    match = re.search(
+        r"Criterios de aceptación:\s*(.*)",
+        contenido_req,
+        flags=re.DOTALL | re.IGNORECASE,
+    )
+    if not match:
+        return []
+
+    bloque_ca = match.group(1)
+    categoria_actual = ""
+    subopciones: list[tuple[str, str]] = []
+
+    for linea in bloque_ca.splitlines():
+        texto = linea.strip()
+        if not texto or texto == "---":
+            continue
+
+        if texto.startswith("-"):
+            subopcion = texto.lstrip("-").strip()
+            if subopcion:
+                subopciones.append((categoria_actual, subopcion))
+        elif texto.endswith(":"):
+            categoria_actual = texto[:-1].strip()
+
+    return subopciones
+
+
+def _completar_casos_funcionales_desde_criterios(
+    datos: dict, contenido_req: str
+) -> dict:
+    """Garantiza que cada subopción de los criterios de aceptación tenga su caso funcional."""
+    subopciones = _extraer_subopciones_criterios(contenido_req)
+    if not subopciones:
+        return datos
+
+    casos_qa = datos.setdefault("casos_de_prueba", {})
+    funcionales = casos_qa.setdefault("funcionales", [])
+    texto_existente = " ".join(
+        c.get("escenario", "").lower() for c in funcionales
+    )
+
+    siguiente_num = len(funcionales) + 1
+    for categoria, subopcion in subopciones:
+        nombre_limpio = subopcion.lower()
+        if nombre_limpio in texto_existente:
+            continue
+
+        contexto_cat = f" en la categoría {categoria}" if categoria else ""
+        escenario = (
+            f"Se debe validar que la subopción {subopcion} esté funcional "
+            f"en el sistema{contexto_cat}."
+        )
+        resultado = (
+            f"La subopción {subopcion} se visualiza y ejecuta correctamente "
+            f"mostrando la información esperada sin errores."
+        )
+
+        funcionales.append(
+            {
+                "id": f"FNC-{siguiente_num:02d}",
+                "escenario": escenario,
+                "resultado_esperado": resultado,
+            }
+        )
+        texto_existente += f" {nombre_limpio}"
+        siguiente_num += 1
+
+    return datos
+
+
+def _parsear_ids_desde_texto(texto: str) -> list[int]:
+    ids: list[int] = []
+    for parte in texto.split(","):
+        limpio = parte.strip()
+        if limpio.isdigit():
+            valor = int(limpio)
+            if valor not in ids:
+                ids.append(valor)
+    return ids
+
+
+def _procesar_y_guardar_qa(
+    contenido_req: str,
+    tipo_fuente: str,
+    nombre_base_salida: str,
+    carpeta_docs: Path,
+    carpeta_salidas: Path,
+) -> None:
+    timer = TimerEjecucion()
+    desde_cache = False
+
+    print("[2/4] Consultando estándares QA en el motor RAG...")
+    contexto_rag = recuperar_contexto_rag(
+        consulta="refinamiento historias de usuario pruebas humo funcionales regresion automatizacion escalamiento",
+        carpeta_docs=str(carpeta_docs),
+        top_k=3,
+    )
+
+    prompt_usuario = f"""
+POLÍTICAS INTERNAS DE QA (RAG):
+{contexto_rag}
+
+REQUERIMIENTO DEL CLIENTE ({tipo_fuente.upper()}):
+{contenido_req}
+
+Analiza el requerimiento y genera el JSON solicitado aplicando las políticas de QA.
+"""
+
+    carpeta_cache = Path(__file__).parent / ".cache_qa"
+    clave_cache = calcular_clave_cache(
+        contenido_req=contenido_req,
+        contexto_rag=contexto_rag,
+        modelo=MODELO_OLLAMA,
+    )
+    datos_estructurados = leer_cache_qa(carpeta_cache, clave_cache)
+
+    if datos_estructurados is not None:
+        desde_cache = True
+        print(f"[3/4] Resultado recuperado desde caché local ({clave_cache[:10]}...).")
+    else:
+        print(f"[3/4] Procesando con {MODELO_OLLAMA} en Ollama...")
+        respuesta_cruda = preguntar_llm(
+            prompt=prompt_usuario,
+            system_prompt=SYSTEM_PROMPT_QA,
+            modelo=MODELO_OLLAMA,
+            timeout=900,
+        )
+
+        if respuesta_cruda.startswith("ERROR_"):
+            print(f"Fallo en LLM: {respuesta_cruda}")
+            return
+
+        extraido = extraer_json(respuesta_cruda)
+        if extraido:
+            datos_estructurados = normalizar_y_validar_qa(extraido)
+            datos_estructurados = _completar_casos_funcionales_desde_criterios(
+                datos_estructurados, contenido_req
+            )
+            guardar_cache_qa(carpeta_cache, clave_cache, datos_estructurados)
+
+    print("[4/4] Guardando resultados en carpeta salidas/...")
+    if datos_estructurados:
+        ruta_json = carpeta_salidas / f"{nombre_base_salida}_qa.json"
+        ruta_json.write_text(
+            json.dumps(datos_estructurados, ensure_ascii=False, indent=2),
+            encoding="utf-8",
+        )
+        print(f"JSON estructurado guardado en: {ruta_json}")
+
+        ruta_docx = carpeta_salidas / f"{nombre_base_salida}_qa.docx"
+        ruta_guardada = guardar_docx_seguro(
+            datos_estructurados, ruta_docx, exportar_qa_a_word
+        )
+        if ruta_guardada:
+            print(f"Documento Word guardado en: {ruta_guardada}")
+
+        subopciones_ca = _extraer_subopciones_criterios(contenido_req)
+        eval_cov = evaluar_cobertura_criterios(datos_estructurados, subopciones_ca)
+        registrar_metricas_ejecucion(
+            carpeta_salidas=carpeta_salidas,
+            nombre_salida=nombre_base_salida,
+            tipo_fuente=tipo_fuente,
+            modelo=MODELO_OLLAMA,
+            desde_cache=desde_cache,
+            duracion_seg=timer.elapsed_seg(),
+            datos_qa=datos_estructurados,
+            eval_cobertura=eval_cov,
+        )
+    else:
+        print("No se pudo extraer un JSON válido de la respuesta del modelo.")
+
+
+def ejecutar_pipeline_qa(nombre_archivo: str) -> None:
+    base_dir = Path(__file__).parent
+    ruta_entrada = base_dir / "entradas" / nombre_archivo
+    carpeta_docs = base_dir / "documentos"
+    carpeta_salidas = base_dir / "salidas"
+    carpeta_salidas.mkdir(parents=True, exist_ok=True)
+
+    print(f"[1/4] Leyendo archivo de requerimiento: {ruta_entrada}")
+    lectura = leer_archivo_requerimiento(str(ruta_entrada))
+    if not lectura["ok"]:
+        print(f"Error al leer archivo: {lectura['error']}")
+        return
+
+    contenido_req = lectura["contenido"][:4500]
+    base_nombre = Path(nombre_archivo).stem
+
+    _procesar_y_guardar_qa(
+        contenido_req=contenido_req,
+        tipo_fuente=lectura["tipo"],
+        nombre_base_salida=base_nombre,
+        carpeta_docs=carpeta_docs,
+        carpeta_salidas=carpeta_salidas,
+    )
+
+
+def ejecutar_pipeline_qa_devops(
+    work_item_id: int | None = None,
+    ids_manuales: list[int] | None = None,
+    nombre_salida_custom: str | None = None,
+    top: int = 5,
+) -> None:
+    base_dir = Path(__file__).parent
+    carpeta_docs = base_dir / "documentos"
+    carpeta_salidas = base_dir / "salidas"
+    carpeta_salidas.mkdir(parents=True, exist_ok=True)
+
+    print("[1/4] Consultando Work Items desde Azure DevOps...")
+    cliente = AzureDevOpsCliente()
+
+    if ids_manuales:
+        ids = ids_manuales
+        nombre_salida = nombre_salida_custom or f"wi_{'_'.join(str(i) for i in ids[:3])}"
+    elif work_item_id is not None:
+        ids = [work_item_id]
+        nombre_salida = nombre_salida_custom or f"wi_{work_item_id}"
+    else:
+        ids = cliente.listar_ids_work_items(top=top)
+        nombre_salida = nombre_salida_custom or f"devops_top_{top}"
+
+    items = cliente.obtener_work_items(ids)
+    if not items:
+        print("No se encontraron Work Items para procesar.")
+        return
+
+    textos_formateados = [formatear_work_item(item) for item in items]
+    contenido_req = "\n\n---\n\n".join(textos_formateados)[:12000]
+
+    _procesar_y_guardar_qa(
+        contenido_req=contenido_req,
+        tipo_fuente="AZURE DEVOPS WORK ITEM",
+        nombre_base_salida=nombre_salida,
+        carpeta_docs=carpeta_docs,
+        carpeta_salidas=carpeta_salidas,
+    )
+
+
+def ejecutar_pipeline_qa_interactivo(top: int = 10) -> None:
+    cliente = AzureDevOpsCliente()
+
+    print("\n¿Cómo quieres seleccionar los Work Items de Azure DevOps?")
+    print("1. Ingresar uno o varios IDs manualmente (ej. 57265 o 57265,63693)")
+    print("2. Listar los últimos Work Items, filtrar por tipo y elegir cuáles procesar")
+    opcion = input("Selecciona una opción (1 o 2, Enter para 1): ").strip()
+
+    if opcion == "2":
+        filtro_tipo = (
+            input(
+                "Filtrar por tipo (ej. User Story, Bug, Task) o Enter para todos: "
+            )
+            .strip()
+            .lower()
+        )
+        ids_recientes = cliente.listar_ids_work_items(top=top)
+        items = cliente.obtener_work_items(ids_recientes)
+
+        if filtro_tipo:
+            items = [
+                item
+                for item in items
+                if item.get("tipo", "").strip().lower() == filtro_tipo
+            ]
+
+        if not items:
+            print("No hay Work Items que coincidan con el criterio.")
+            return
+
+        print("\nWork Items disponibles:")
+        for item in items:
+            print(
+                f"  - ID: {item['id']} | Tipo: {item['tipo']} | "
+                f"Estado: {item['estado']} | Título: {item['titulo']}"
+            )
+
+        seleccion = input(
+            "\nEscribe los IDs a procesar separados por coma (o Enter para todos los listados): "
+        ).strip()
+
+        if not seleccion:
+            ids_elegidos = [item["id"] for item in items]
+        else:
+            ids_elegidos = _parsear_ids_desde_texto(seleccion)
+
+        if not ids_elegidos:
+            print("No se seleccionaron IDs válidos.")
+            return
+
+        nombre_salida = f"wi_{'_'.join(str(i) for i in ids_elegidos[:3])}"
+        ejecutar_pipeline_qa_devops(
+            ids_manuales=ids_elegidos,
+            nombre_salida_custom=nombre_salida,
+            top=top,
+        )
+    else:
+        entrada_ids = input("Escribe el ID o IDs separados por coma (ej. 57265): ").strip()
+        ids_elegidos = _parsear_ids_desde_texto(entrada_ids)
+        if not ids_elegidos:
+            print("No se ingresaron IDs numéricos válidos.")
+            return
+
+        nombre_salida = f"wi_{'_'.join(str(i) for i in ids_elegidos[:3])}"
+        ejecutar_pipeline_qa_devops(
+            ids_manuales=ids_elegidos,
+            nombre_salida_custom=nombre_salida,
+            top=top,
+        )
+
+
+if __name__ == "__main__":
+    print("Origen del requerimiento:")
+    print("1. Azure DevOps (seleccionar ID o listar recientes)")
+    print("2. Archivo local en carpeta entradas/")
+    modo = input("Elige 1 o 2 (Enter para Azure DevOps): ").strip()
+
+    if modo == "2":
+        archivo_prueba = "GP-FM-01 Requerimiento - Convenio de infracciones creadas.xlsx"
+        ejecutar_pipeline_qa(archivo_prueba)
+    else:
+        ejecutar_pipeline_qa_interactivo(top=10)

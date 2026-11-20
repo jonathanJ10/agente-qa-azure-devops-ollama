@@ -1,0 +1,6 @@
+ESTANDARES DE CALIDAD (QA):
+1. Refinamiento de Historias de Usuario (HU): Toda HU debe tener objetivo claro, actor, precondiciones, criterios de aceptación verificables y reglas de negocio explícitas. Si falta información crítica, se debe marcar para ESCALAMIENTO al analista funcional o líder técnico.
+2. Pruebas de Humo (Smoke): Validan únicamente los flujos críticos de arranque y operación básica tras un despliegue para saber si el sistema es estable para seguir probando.
+3. Pruebas Funcionales: Verifican el cumplimiento de cada criterio de aceptación, caminos felices, caminos alternos, validaciones de campos y mensajes de error.
+4. Pruebas de Regresión: Verifican que los cambios o nuevas funcionalidades no hayan roto módulos existentes o integraciones previas.
+5. Pruebas Automatizadas: Se priorizan casos repetitivos, estables, de alta prioridad o de regresión crítica, indicando qué validar y qué datos o precondiciones automatizar.

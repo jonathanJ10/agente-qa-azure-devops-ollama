@@ -1,0 +1,120 @@
+import base64
+import html
+import json
+import re
+import urllib.parse
+import urllib.request
+from settings import settings
+
+
+def limpiar_html(texto_html: str) -> str:
+    if not texto_html:
+        return ""
+    # Reemplaza saltos de línea y cierres de bloque HTML por saltos de línea
+    texto = re.sub(r"<br\s*/?>", "\n", texto_html, flags=re.IGNORECASE)
+    texto = re.sub(r"</(p|div|li|tr|h[1-6])>", "\n", texto, flags=re.IGNORECASE)
+    # Elimina el resto de etiquetas HTML
+    texto = re.sub(r"<[^>]+>", "", texto)
+    # Decodifica entidades HTML ( , &, <, etc.)
+    texto = html.unescape(texto)
+    # Limpia espacios múltiples y líneas vacías excesivas
+    lineas = [linea.strip() for linea in texto.splitlines()]
+    return "\n".join(linea for linea in lineas if linea)
+
+
+def formatear_work_item(item: dict) -> str:
+    descripcion_limpia = limpiar_html(item.get("descripcion", ""))
+    criterios_limpios = limpiar_html(item.get("criterios_aceptacion", ""))
+
+    bloques = [
+        f"ID: {item.get('id')}",
+        f"Tipo: {item.get('tipo', '')}",
+        f"Estado: {item.get('estado', '')}",
+        f"Título: {item.get('titulo', '')}",
+        f"Descripción:\n{descripcion_limpia if descripcion_limpia else '(Sin descripción registrada)'}",
+        f"Criterios de aceptación:\n{criterios_limpios if criterios_limpios else '(Sin criterios de aceptación registrados)'}",
+    ]
+
+    return "\n\n".join(bloques)
+
+
+class AzureDevOpsCliente:
+    def __init__(self) -> None:
+        settings.validar()
+        credenciales = f":{settings.pat}".encode("utf-8")
+        token_b64 = base64.b64encode(credenciales).decode("ascii")
+        self.headers = {
+            "Authorization": f"Basic {token_b64}",
+            "Content-Type": "application/json",
+        }
+
+    def listar_ids_work_items(self, top: int = 10) -> list[int]:
+        url = (
+            f"{settings.base_url}/{settings.project}/_apis/wit/wiql"
+            f"?api-version={settings.api_version}"
+        )
+        consulta = {
+            "query": (
+                f"SELECT [System.Id] FROM WorkItems "
+                f"WHERE [System.TeamProject] = '{settings.project}' "
+                f"AND [System.ChangedDate] >= '2026-01-01' "
+                f"ORDER BY [System.ChangedDate] DESC"
+            ),
+            "top": top,
+        }
+        req = urllib.request.Request(
+            url,
+            data=json.dumps(consulta).encode("utf-8"),
+            headers=self.headers,
+            method="POST",
+        )
+        with urllib.request.urlopen(req) as resp:
+            datos = json.loads(resp.read().decode("utf-8"))
+
+        items = datos.get("workItems", [])[:top]
+        return [item["id"] for item in items]
+
+    def obtener_work_items(self, ids: list[int]) -> list[dict]:
+        if not ids:
+            return []
+
+        ids_str = ",".join(map(str, ids))
+        campos = [
+            "System.Id",
+            "System.Title",
+            "System.WorkItemType",
+            "System.State",
+            "System.Description",
+            "Microsoft.VSTS.Common.AcceptanceCriteria",
+        ]
+        campos_str = urllib.parse.quote(",".join(campos))
+
+        url = (
+            f"{settings.base_url}/{settings.project}/_apis/wit/workitems"
+            f"?ids={ids_str}&fields={campos_str}&api-version={settings.api_version}"
+        )
+
+        req = urllib.request.Request(
+            url,
+            headers=self.headers,
+            method="GET",
+        )
+        with urllib.request.urlopen(req) as resp:
+            datos = json.loads(resp.read().decode("utf-8"))
+
+        resultado = []
+        for item in datos.get("value", []):
+            campos_item = item.get("fields", {})
+            resultado.append(
+                {
+                    "id": item.get("id"),
+                    "tipo": campos_item.get("System.WorkItemType", ""),
+                    "titulo": campos_item.get("System.Title", ""),
+                    "estado": campos_item.get("System.State", ""),
+                    "descripcion": campos_item.get("System.Description", ""),
+                    "criterios_aceptacion": campos_item.get(
+                        "Microsoft.VSTS.Common.AcceptanceCriteria", ""
+                    ),
+                }
+            )
+        return resultado
