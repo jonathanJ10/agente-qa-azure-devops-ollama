@@ -17,10 +17,13 @@ from observabilidad_evals import (
     evaluar_cobertura_criterios,
     registrar_metricas_ejecucion,
 )
+from reporte_ejecutivo_qa import generar_resumen_ejecutivo_md, imprimir_resumen_consola
 from reranker_rag import preparar_texto_por_secciones, rerank_fragmentos_rag
+from subagentes_qa import ejecutar_orquestacion_subagentes_qa
 from trazabilidad_qa import construir_matriz_trazabilidad
 
 MODELO_OLLAMA = "llama3"
+MODELO_RAPIDO = "llama3.2:3b"
 
 SYSTEM_PROMPT_QA = """
 Eres un Arquitecto y Analista Senior de QA especializado en ingeniería de software y arquitectura agéntica.
@@ -156,6 +159,7 @@ def _procesar_y_guardar_qa(
     nombre_base_salida: str,
     carpeta_docs: Path,
     carpeta_salidas: Path,
+    modo_orquestacion: str = "directo",
 ) -> None:
     timer = TimerEjecucion()
     desde_cache = False
@@ -177,12 +181,37 @@ def _procesar_y_guardar_qa(
         contenido_req=contenido_req,
         cantidad_subopciones=len(subopciones_ca),
         modelo_base=MODELO_OLLAMA,
-        modelo_rapido="llama3.2:3b",
+        modelo_rapido=MODELO_RAPIDO,
         modelo_complejo=MODELO_OLLAMA,
     )
     print(f"[Router] Modelo seleccionado: {modelo_activo} ({motivo_ruta})")
 
-    prompt_usuario = f"""
+    carpeta_cache = Path(__file__).parent / ".cache_qa"
+    extraido: dict | None = None
+
+    if modo_orquestacion == "subagentes":
+        print("[3/4] Orquestando subagentes especializados por etapa...")
+        extraido, modelo_efectivo = ejecutar_orquestacion_subagentes_qa(
+            contenido_req=contenido_req,
+            contexto_rag=contexto_rag,
+            tipo_fuente=tipo_fuente,
+            modelo_principal=modelo_activo,
+            modelo_rapido=MODELO_RAPIDO,
+            carpeta_cache=carpeta_cache,
+            preguntar_fn=preguntar_llm,
+            extraer_json_fn=extraer_json,
+            timeout=900,
+        )
+        modelo_activo = modelo_efectivo
+        if not extraido:
+            print("Los subagentes no devolvieron una estructura válida.")
+            return
+        datos_estructurados = normalizar_y_validar_qa(extraido)
+        datos_estructurados = _completar_casos_funcionales_desde_criterios(
+            datos_estructurados, contenido_req
+        )
+    else:
+        prompt_usuario = f"""
 POLÍTICAS INTERNAS DE QA (RAG):
 {contexto_rag}
 
@@ -191,43 +220,41 @@ REQUERIMIENTO DEL CLIENTE ({tipo_fuente.upper()}):
 
 Analiza el requerimiento y genera el JSON solicitado aplicando las políticas de QA.
 """
-
-    carpeta_cache = Path(__file__).parent / ".cache_qa"
-    clave_cache = calcular_clave_cache(
-        contenido_req=contenido_req,
-        contexto_rag=contexto_rag,
-        modelo=modelo_activo,
-    )
-    datos_estructurados = leer_cache_qa(carpeta_cache, clave_cache)
-
-    if datos_estructurados is not None:
-        desde_cache = True
-        print(f"[3/4] Resultado recuperado desde caché local ({clave_cache[:10]}...).")
-    else:
-        print(f"[3/4] Procesando con {modelo_activo} en Ollama...")
-        extraido, modelo_efectivo, info_res = ejecutar_llm_con_resiliencia(
-            prompt=prompt_usuario,
-            system_prompt=SYSTEM_PROMPT_QA,
-            modelo_principal=modelo_activo,
-            preguntar_fn=preguntar_llm,
-            extraer_json_fn=extraer_json,
-            modelo_fallback="llama3.2:3b",
-            timeout=900,
-            max_reintentos_por_modelo=1,
+        clave_cache = calcular_clave_cache(
+            contenido_req=contenido_req,
+            contexto_rag=contexto_rag,
+            modelo=modelo_activo,
         )
-        modelo_activo = modelo_efectivo
+        datos_estructurados = leer_cache_qa(carpeta_cache, clave_cache)
 
-        if extraido:
-            datos_estructurados = normalizar_y_validar_qa(extraido)
-            datos_estructurados = _completar_casos_funcionales_desde_criterios(
-                datos_estructurados, contenido_req
-            )
-            guardar_cache_qa(carpeta_cache, clave_cache, datos_estructurados)
+        if datos_estructurados is not None:
+            desde_cache = True
+            print(f"[3/4] Resultado recuperado desde caché local ({clave_cache[:10]}...).")
         else:
-            print(
-                f"Fallo tras reintentos/fallback ({info_res['ultimo_error']})."
+            print(f"[3/4] Procesando con {modelo_activo} en Ollama...")
+            extraido, modelo_efectivo, info_res = ejecutar_llm_con_resiliencia(
+                prompt=prompt_usuario,
+                system_prompt=SYSTEM_PROMPT_QA,
+                modelo_principal=modelo_activo,
+                preguntar_fn=preguntar_llm,
+                extraer_json_fn=extraer_json,
+                modelo_fallback=MODELO_RAPIDO,
+                timeout=900,
+                max_reintentos_por_modelo=1,
             )
-            return
+            modelo_activo = modelo_efectivo
+
+            if extraido:
+                datos_estructurados = normalizar_y_validar_qa(extraido)
+                datos_estructurados = _completar_casos_funcionales_desde_criterios(
+                    datos_estructurados, contenido_req
+                )
+                guardar_cache_qa(carpeta_cache, clave_cache, datos_estructurados)
+            else:
+                print(
+                    f"Fallo tras reintentos/fallback ({info_res['ultimo_error']})."
+                )
+                return
 
     print("[4/4] Guardando resultados en carpeta salidas/...")
     if datos_estructurados:
@@ -278,11 +305,24 @@ Analiza el requerimiento y genera el JSON solicitado aplicando las políticas de
             f"{trazabilidad['total_criterios_detectados']} "
             f"({trazabilidad['porcentaje_trazabilidad']}%) -> {ruta_traza.name}"
         )
+
+        imprimir_resumen_consola(datos_estructurados)
+        ruta_resumen = generar_resumen_ejecutivo_md(
+            datos_qa=datos_estructurados,
+            nombre_salida=nombre_base_salida,
+            carpeta_salidas=carpeta_salidas,
+            modelo_usado=modelo_activo,
+            eval_calidad=eval_calidad,
+            trazabilidad=trazabilidad,
+        )
+        print(f"[Resumen MD] Guardado en: {ruta_resumen.name}")
     else:
         print("No se pudo extraer un JSON válido de la respuesta del modelo.")
 
 
-def ejecutar_pipeline_qa(nombre_archivo: str) -> None:
+def ejecutar_pipeline_qa(
+    nombre_archivo: str, modo_orquestacion: str = "directo"
+) -> None:
     base_dir = Path(__file__).parent
     ruta_entrada = base_dir / "entradas" / nombre_archivo
     carpeta_docs = base_dir / "documentos"
@@ -304,6 +344,7 @@ def ejecutar_pipeline_qa(nombre_archivo: str) -> None:
         nombre_base_salida=base_nombre,
         carpeta_docs=carpeta_docs,
         carpeta_salidas=carpeta_salidas,
+        modo_orquestacion=modo_orquestacion,
     )
 
 
@@ -312,6 +353,7 @@ def ejecutar_pipeline_qa_devops(
     ids_manuales: list[int] | None = None,
     nombre_salida_custom: str | None = None,
     top: int = 5,
+    modo_orquestacion: str = "directo",
 ) -> None:
     base_dir = Path(__file__).parent
     carpeta_docs = base_dir / "documentos"
@@ -347,10 +389,13 @@ def ejecutar_pipeline_qa_devops(
         nombre_base_salida=nombre_salida,
         carpeta_docs=carpeta_docs,
         carpeta_salidas=carpeta_salidas,
+        modo_orquestacion=modo_orquestacion,
     )
 
 
-def ejecutar_pipeline_qa_interactivo(top: int = 10) -> None:
+def ejecutar_pipeline_qa_interactivo(
+    top: int = 10, modo_orquestacion: str = "directo"
+) -> None:
     cliente = AzureDevOpsCliente()
 
     print("\n¿Cómo quieres seleccionar los Work Items de Azure DevOps?")
@@ -405,6 +450,7 @@ def ejecutar_pipeline_qa_interactivo(top: int = 10) -> None:
             ids_manuales=ids_elegidos,
             nombre_salida_custom=nombre_salida,
             top=top,
+            modo_orquestacion=modo_orquestacion,
         )
     else:
         entrada_ids = input("Escribe el ID o IDs separados por coma (ej. 57265): ").strip()
@@ -418,17 +464,24 @@ def ejecutar_pipeline_qa_interactivo(top: int = 10) -> None:
             ids_manuales=ids_elegidos,
             nombre_salida_custom=nombre_salida,
             top=top,
+            modo_orquestacion=modo_orquestacion,
         )
 
 
 if __name__ == "__main__":
-    print("Origen del requerimiento:")
+    print("Estrategia de generación LLM:")
+    print("1. Directa (1 llamada con resiliencia/fallback)")
+    print("2. Subagentes por etapa (refinamiento, historias, casos)")
+    estrategia = input("Elige 1 o 2 (Enter para 1): ").strip()
+    modo_llm = "subagentes" if estrategia == "2" else "directo"
+
+    print("\nOrigen del requerimiento:")
     print("1. Azure DevOps (seleccionar ID o listar recientes)")
     print("2. Archivo local en carpeta entradas/")
     modo = input("Elige 1 o 2 (Enter para Azure DevOps): ").strip()
 
     if modo == "2":
         archivo_prueba = "GP-FM-01 Requerimiento - Convenio de infracciones creadas.xlsx"
-        ejecutar_pipeline_qa(archivo_prueba)
+        ejecutar_pipeline_qa(archivo_prueba, modo_orquestacion=modo_llm)
     else:
-        ejecutar_pipeline_qa_interactivo(top=10)
+        ejecutar_pipeline_qa_interactivo(top=10, modo_orquestacion=modo_llm)
