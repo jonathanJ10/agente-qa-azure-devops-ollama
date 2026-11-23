@@ -200,7 +200,7 @@ def _procesar_y_guardar_qa(
             carpeta_cache=carpeta_cache,
             preguntar_fn=preguntar_llm,
             extraer_json_fn=extraer_json,
-            timeout=900,
+            timeout=10000,
         )
         modelo_activo = modelo_efectivo
         if not extraido:
