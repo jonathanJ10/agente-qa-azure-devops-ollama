@@ -4,16 +4,21 @@ from pathlib import Path
 
 from azure_devops_cliente import AzureDevOpsCliente, formatear_work_item
 from cache_qa import calcular_clave_cache, guardar_cache_qa, leer_cache_qa
+from calidad_qa import evaluar_calidad_artefactos
 from exportador_word import exportar_qa_a_word
 from guardrails_qa import guardar_docx_seguro, normalizar_y_validar_qa
 from lector_archivos import leer_archivo_requerimiento
 from llm_cliente import extraer_json, preguntar_llm
+from llm_resilience import ejecutar_llm_con_resiliencia
+from model_router import seleccionar_modelo_qa
 from motor_rag import recuperar_contexto_rag
 from observabilidad_evals import (
     TimerEjecucion,
     evaluar_cobertura_criterios,
     registrar_metricas_ejecucion,
 )
+from reranker_rag import preparar_texto_por_secciones, rerank_fragmentos_rag
+from trazabilidad_qa import construir_matriz_trazabilidad
 
 MODELO_OLLAMA = "llama3"
 
@@ -161,6 +166,21 @@ def _procesar_y_guardar_qa(
         carpeta_docs=str(carpeta_docs),
         top_k=3,
     )
+    contexto_rag = rerank_fragmentos_rag(
+        consulta="refinamiento historias de usuario pruebas humo funcionales regresion automatizacion escalamiento criterios de aceptacion",
+        fragmentos=contexto_rag,
+        top_k=3,
+    )
+
+    subopciones_ca = _extraer_subopciones_criterios(contenido_req)
+    modelo_activo, motivo_ruta = seleccionar_modelo_qa(
+        contenido_req=contenido_req,
+        cantidad_subopciones=len(subopciones_ca),
+        modelo_base=MODELO_OLLAMA,
+        modelo_rapido="llama3.2:3b",
+        modelo_complejo=MODELO_OLLAMA,
+    )
+    print(f"[Router] Modelo seleccionado: {modelo_activo} ({motivo_ruta})")
 
     prompt_usuario = f"""
 POLÍTICAS INTERNAS DE QA (RAG):
@@ -176,7 +196,7 @@ Analiza el requerimiento y genera el JSON solicitado aplicando las políticas de
     clave_cache = calcular_clave_cache(
         contenido_req=contenido_req,
         contexto_rag=contexto_rag,
-        modelo=MODELO_OLLAMA,
+        modelo=modelo_activo,
     )
     datos_estructurados = leer_cache_qa(carpeta_cache, clave_cache)
 
@@ -184,25 +204,30 @@ Analiza el requerimiento y genera el JSON solicitado aplicando las políticas de
         desde_cache = True
         print(f"[3/4] Resultado recuperado desde caché local ({clave_cache[:10]}...).")
     else:
-        print(f"[3/4] Procesando con {MODELO_OLLAMA} en Ollama...")
-        respuesta_cruda = preguntar_llm(
+        print(f"[3/4] Procesando con {modelo_activo} en Ollama...")
+        extraido, modelo_efectivo, info_res = ejecutar_llm_con_resiliencia(
             prompt=prompt_usuario,
             system_prompt=SYSTEM_PROMPT_QA,
-            modelo=MODELO_OLLAMA,
+            modelo_principal=modelo_activo,
+            preguntar_fn=preguntar_llm,
+            extraer_json_fn=extraer_json,
+            modelo_fallback="llama3.2:3b",
             timeout=900,
+            max_reintentos_por_modelo=1,
         )
+        modelo_activo = modelo_efectivo
 
-        if respuesta_cruda.startswith("ERROR_"):
-            print(f"Fallo en LLM: {respuesta_cruda}")
-            return
-
-        extraido = extraer_json(respuesta_cruda)
         if extraido:
             datos_estructurados = normalizar_y_validar_qa(extraido)
             datos_estructurados = _completar_casos_funcionales_desde_criterios(
                 datos_estructurados, contenido_req
             )
             guardar_cache_qa(carpeta_cache, clave_cache, datos_estructurados)
+        else:
+            print(
+                f"Fallo tras reintentos/fallback ({info_res['ultimo_error']})."
+            )
+            return
 
     print("[4/4] Guardando resultados en carpeta salidas/...")
     if datos_estructurados:
@@ -220,17 +245,38 @@ Analiza el requerimiento y genera el JSON solicitado aplicando las políticas de
         if ruta_guardada:
             print(f"Documento Word guardado en: {ruta_guardada}")
 
-        subopciones_ca = _extraer_subopciones_criterios(contenido_req)
         eval_cov = evaluar_cobertura_criterios(datos_estructurados, subopciones_ca)
         registrar_metricas_ejecucion(
             carpeta_salidas=carpeta_salidas,
             nombre_salida=nombre_base_salida,
             tipo_fuente=tipo_fuente,
-            modelo=MODELO_OLLAMA,
+            modelo=modelo_activo,
             desde_cache=desde_cache,
             duracion_seg=timer.elapsed_seg(),
             datos_qa=datos_estructurados,
             eval_cobertura=eval_cov,
+        )
+
+        eval_calidad = evaluar_calidad_artefactos(datos_estructurados)
+        print(
+            f"[Calidad QA] Puntaje: {eval_calidad['puntaje']}/100 | "
+            f"Aprobado: {eval_calidad['aprobado']}"
+        )
+        for adv in eval_calidad["advertencias"]:
+            print(f"  - Advertencia: {adv}")
+
+        trazabilidad = construir_matriz_trazabilidad(
+            datos_estructurados, subopciones_ca
+        )
+        ruta_traza = carpeta_salidas / f"{nombre_base_salida}_trazabilidad.json"
+        ruta_traza.write_text(
+            json.dumps(trazabilidad, ensure_ascii=False, indent=2),
+            encoding="utf-8",
+        )
+        print(
+            f"[Trazabilidad QA] {trazabilidad['criterios_cubiertos']}/"
+            f"{trazabilidad['total_criterios_detectados']} "
+            f"({trazabilidad['porcentaje_trazabilidad']}%) -> {ruta_traza.name}"
         )
     else:
         print("No se pudo extraer un JSON válido de la respuesta del modelo.")
@@ -249,7 +295,7 @@ def ejecutar_pipeline_qa(nombre_archivo: str) -> None:
         print(f"Error al leer archivo: {lectura['error']}")
         return
 
-    contenido_req = lectura["contenido"][:4500]
+    contenido_req = preparar_texto_por_secciones(lectura["contenido"], max_chars=4500)
     base_nombre = Path(nombre_archivo).stem
 
     _procesar_y_guardar_qa(
@@ -291,7 +337,9 @@ def ejecutar_pipeline_qa_devops(
         return
 
     textos_formateados = [formatear_work_item(item) for item in items]
-    contenido_req = "\n\n---\n\n".join(textos_formateados)[:12000]
+    contenido_req = preparar_texto_por_secciones(
+        "\n\n---\n\n".join(textos_formateados), max_chars=12000
+    )
 
     _procesar_y_guardar_qa(
         contenido_req=contenido_req,
