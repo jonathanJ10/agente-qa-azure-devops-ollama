@@ -71,30 +71,92 @@ Reglas obligatorias de desglose y cobertura:
 
 
 def _extraer_subopciones_criterios(contenido_req: str) -> list[tuple[str, str]]:
-    """Extrae pares (categoria, subopcion) a partir del bloque de Criterios de aceptación."""
-    match = re.search(
-        r"Criterios de aceptación:\s*(.*)",
+    """Extrae pares (categoria, subopcion) soportando viñetas, numeración y Excel sin guiones."""
+    if not contenido_req or not contenido_req.strip():
+        return []
+
+    # 1. Intentar aislar un bloque explícito de criterios/reglas si existe
+    match_bloque = re.search(
+        r"(?:criterios(?:\s+de\s+aceptaci[oó]n)?|subopciones|reglas\s+de\s+negocio|alcance)\s*:\s*(.*)",
         contenido_req,
         flags=re.DOTALL | re.IGNORECASE,
     )
-    if not match:
-        return []
+    texto_objetivo = match_bloque.group(1) if match_bloque else contenido_req
 
-    bloque_ca = match.group(1)
     categoria_actual = ""
     subopciones: list[tuple[str, str]] = []
+    vistos: set[str] = set()
 
-    for linea in bloque_ca.splitlines():
-        texto = linea.strip()
-        if not texto or texto == "---":
+    patrones_item = re.compile(
+        r"^(?:[-*•–—]+|\d+[.)\-]|(?i:[a-z])[.)])\s*(.+)$"
+    )
+    patrones_etiqueta = re.compile(
+        r"^(?:criterio|subopci[oó]n|requisito|regla|validaci[oó]n|escenario)\s*[:\-]\s*(.+)$",
+        flags=re.IGNORECASE,
+    )
+    prefijos_metadata = (
+        "id:",
+        "tipo:",
+        "estado:",
+        "título:",
+        "titulo:",
+        "descripción:",
+        "descripcion:",
+        "hoja:",
+        "sheet:",
+    )
+
+    for linea_raw in texto_objetivo.splitlines():
+        texto = re.sub(r"\s+", " ", linea_raw).strip()
+        if not texto or re.fullmatch(r"[-_=*]{3,}", texto):
             continue
 
-        if texto.startswith("-"):
-            subopcion = texto.lstrip("-").strip()
-            if subopcion:
+        lower = texto.lower()
+        if not match_bloque and lower.startswith(prefijos_metadata):
+            continue
+
+        # Si viene en formato tabla tipo "Col1 | Col2 | Col3" desde Excel
+        if "|" in texto:
+            celdas = [c.strip() for c in texto.split("|") if c.strip()]
+            if len(celdas) >= 2:
+                candidato = " - ".join(celdas)
+                clave = candidato.lower()
+                if len(candidato) >= 4 and clave not in vistos:
+                    vistos.add(clave)
+                    subopciones.append((categoria_actual, candidato))
+                continue
+
+        # Detectar viñetas (-, *, •, –) o listas numeradas (1., 1), a))
+        m_item = patrones_item.match(texto)
+        if m_item:
+            subopcion = m_item.group(1).strip()
+            clave = subopcion.lower()
+            if len(subopcion) >= 3 and clave not in vistos:
+                vistos.add(clave)
                 subopciones.append((categoria_actual, subopcion))
-        elif texto.endswith(":"):
+            continue
+
+        # Detectar líneas con etiqueta tipo "Criterio: ..." o "Subopción: ..."
+        m_etiq = patrones_etiqueta.match(texto)
+        if m_etiq:
+            subopcion = m_etiq.group(1).strip()
+            clave = subopcion.lower()
+            if len(subopcion) >= 3 and clave not in vistos:
+                vistos.add(clave)
+                subopciones.append((categoria_actual, subopcion))
+            continue
+
+        # Detectar categoría que termina en ":"
+        if texto.endswith(":") and len(texto) <= 90:
             categoria_actual = texto[:-1].strip()
+            continue
+
+        # Si no hay encabezado explícito de criterios, aprovechar líneas descriptivas sustanciales
+        if not match_bloque and len(texto) >= 25 and not texto.endswith("."):
+            clave = lower
+            if clave not in vistos:
+                vistos.add(clave)
+                subopciones.append((categoria_actual, texto))
 
     return subopciones
 
@@ -138,6 +200,76 @@ def _completar_casos_funcionales_desde_criterios(
         )
         texto_existente += f" {nombre_limpio}"
         siguiente_num += 1
+
+    return datos
+
+
+def _completar_minimos_regresion_y_automatizacion(
+    datos: dict, minimo_por_tipo: int = 2
+) -> dict:
+    """Garantiza un mínimo de casos de regresión y automatización si el LLM los omite."""
+    casos_qa = datos.setdefault("casos_de_prueba", {})
+
+    regresion = casos_qa.setdefault("regresion", [])
+    plantillas_regresion = [
+        (
+            "Validar que la implementación del requerimiento no genere errores ni "
+            "afectaciones colaterales en módulos o flujos relacionados existentes.",
+            "Los módulos relacionados continúan operando con normalidad y sin "
+            "regresiones funcionales.",
+        ),
+        (
+            "Validar que los registros y estados previos en el sistema mantengan "
+            "su integridad y consistencia tras ejecutar los nuevos flujos.",
+            "La información existente permanece íntegra, sin datos corruptos ni "
+            "pérdidas de consistencia.",
+        ),
+    ]
+    idx_reg = len(regresion) + 1
+    for escenario, resultado in plantillas_regresion:
+        if len(regresion) >= minimo_por_tipo:
+            break
+        regresion.append(
+            {
+                "id": f"REG-{idx_reg:02d}",
+                "escenario": escenario,
+                "resultado_esperado": resultado,
+            }
+        )
+        idx_reg += 1
+
+    automatizacion = casos_qa.setdefault("automatizacion", [])
+    plantillas_auto = [
+        (
+            "Ejecutar de forma automatizada las validaciones principales y reglas "
+            "de negocio críticas definidas en el requerimiento.",
+            "Alta repetitividad en cada ciclo de release y validación rápida de "
+            "reglas críticas de negocio.",
+            "El flujo automatizado valida las condiciones clave y reporta "
+            "resultados consistentes sin intervención manual.",
+        ),
+        (
+            "Ejecutar de forma automatizada la prueba de no regresión sobre el "
+            "flujo principal y sus validaciones de entrada/salida.",
+            "Permite detectar regresiones tempranas en integración continua con "
+            "bajo costo de mantenimiento.",
+            "La suite automatizada aprueba el flujo principal y alerta "
+            "inmediatamente ante cualquier desviación.",
+        ),
+    ]
+    idx_auto = len(automatizacion) + 1
+    for escenario, motivo, resultado in plantillas_auto:
+        if len(automatizacion) >= minimo_por_tipo:
+            break
+        automatizacion.append(
+            {
+                "id": f"AUT-{idx_auto:02d}",
+                "escenario": escenario,
+                "candidato_porque": motivo,
+                "resultado_esperado": resultado,
+            }
+        )
+        idx_auto += 1
 
     return datos
 
@@ -200,7 +332,7 @@ def _procesar_y_guardar_qa(
             carpeta_cache=carpeta_cache,
             preguntar_fn=preguntar_llm,
             extraer_json_fn=extraer_json,
-            timeout=10000,
+            timeout=900,
         )
         modelo_activo = modelo_efectivo
         if not extraido:
@@ -209,6 +341,9 @@ def _procesar_y_guardar_qa(
         datos_estructurados = normalizar_y_validar_qa(extraido)
         datos_estructurados = _completar_casos_funcionales_desde_criterios(
             datos_estructurados, contenido_req
+        )
+        datos_estructurados = _completar_minimos_regresion_y_automatizacion(
+            datos_estructurados, minimo_por_tipo=2
         )
     else:
         prompt_usuario = f"""
@@ -248,6 +383,9 @@ Analiza el requerimiento y genera el JSON solicitado aplicando las políticas de
                 datos_estructurados = normalizar_y_validar_qa(extraido)
                 datos_estructurados = _completar_casos_funcionales_desde_criterios(
                     datos_estructurados, contenido_req
+                )
+                datos_estructurados = _completar_minimos_regresion_y_automatizacion(
+                    datos_estructurados, minimo_por_tipo=2
                 )
                 guardar_cache_qa(carpeta_cache, clave_cache, datos_estructurados)
             else:
@@ -335,7 +473,7 @@ def ejecutar_pipeline_qa(
         print(f"Error al leer archivo: {lectura['error']}")
         return
 
-    contenido_req = preparar_texto_por_secciones(lectura["contenido"], max_chars=4500)
+    contenido_req = preparar_texto_por_secciones(lectura["contenido"], max_chars=8000)
     base_nombre = Path(nombre_archivo).stem
 
     _procesar_y_guardar_qa(
