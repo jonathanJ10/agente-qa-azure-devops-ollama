@@ -2,81 +2,102 @@ from pathlib import Path
 from docx import Document
 
 
-def exportar_qa_a_word(datos_qa: dict, ruta_salida_docx: str) -> Path:
-    """Convierte el diccionario estructurado de QA en un documento .docx legible."""
+def _agregar_tabla_casos(
+    doc: Document, casos: list[dict], es_automatizacion: bool = False
+) -> None:
+    if not casos:
+        doc.add_paragraph("No se registraron casos en esta categoría.")
+        return
+
+    encabezados = (
+        ["ID", "Escenario", "Candidato porque", "Resultado esperado"]
+        if es_automatizacion
+        else ["ID", "Escenario", "Resultado esperado"]
+    )
+
+    tabla = doc.add_table(rows=1, cols=len(encabezados))
+    tabla.style = "Table Grid"
+
+    for i, titulo_col in enumerate(encabezados):
+        tabla.rows[0].cells[i].text = titulo_col
+
+    for caso in casos:
+        fila = tabla.add_row().cells
+        fila[0].text = str(caso.get("id", ""))
+        fila[1].text = str(caso.get("escenario", ""))
+        if es_automatizacion:
+            fila[2].text = str(caso.get("candidato_porque", ""))
+            fila[3].text = str(caso.get("resultado_esperado", ""))
+        else:
+            fila[2].text = str(caso.get("resultado_esperado", ""))
+
+
+def exportar_qa_a_word(datos_qa: dict, ruta_salida: str) -> None:
+    """Genera un documento .docx con refinamiento, seguridad, historias y casos QA."""
     doc = Document()
-    doc.add_heading("Reporte de Refinamiento y Estrategia de Pruebas QA", level=1)
+    doc.add_heading("Artefactos de Calidad QA — Movilidad y Tránsito", level=1)
 
-    # 1. Refinamiento y Escalamientos
-    refinamiento = datos_qa.get("refinamiento", {})
-    doc.add_heading("1. Refinamiento y Escalamientos", level=2)
+    # 1. Seguridad y gobierno de la información
+    doc.add_heading("1. Seguridad y gobierno de la información", level=2)
+    doc.add_paragraph(
+        "Las entradas de texto se sanitizan previamente en el pipeline para enmascarar "
+        "datos sensibles o de identificación (documentos, correos, teléfonos, placas, "
+        "números de trámite/comparendo y credenciales) y mitigar instrucciones no confiables "
+        "antes de enviar contexto a modelos o caché."
+    )
 
-    doc.add_heading("Observaciones Críticas", level=3)
-    obs = refinamiento.get("observaciones_criticas", [])
+    # 2. Refinamiento QA
+    ref = datos_qa.get("refinamiento", {}) if isinstance(datos_qa, dict) else {}
+    doc.add_heading("2. Refinamiento QA y escalamiento", level=2)
+
+    doc.add_heading("Observaciones críticas", level=3)
+    obs = ref.get("observaciones_criticas", []) or []
     if obs:
         for item in obs:
             doc.add_paragraph(str(item), style="List Bullet")
     else:
-        doc.add_paragraph("Sin observaciones críticas reportadas.")
+        doc.add_paragraph("Sin observaciones críticas registradas.")
 
-    doc.add_heading("Preguntas de Escalamiento", level=3)
-    pregs = refinamiento.get("preguntas_escalamiento", [])
+    doc.add_heading("Preguntas de escalamiento", level=3)
+    pregs = ref.get("preguntas_escalamiento", []) or []
     if pregs:
         for item in pregs:
             doc.add_paragraph(str(item), style="List Bullet")
     else:
-        doc.add_paragraph("Sin preguntas de escalamiento pendientes.")
+        doc.add_paragraph("Sin preguntas de escalamiento registradas.")
 
-    # 2. Historias de Usuario
-    doc.add_heading("2. Historias de Usuario", level=2)
-    hus = datos_qa.get("historias_de_usuario", [])
-    if hus:
-        for hu in hus:
-            hu_id = hu.get("id", "HU")
-            titulo = hu.get("titulo", "Sin título")
-            doc.add_heading(f"{hu_id}: {titulo}", level=3)
-            if hu.get("descripcion"):
-                doc.add_paragraph(f"Descripción: {hu['descripcion']}")
-            for ca in hu.get("criterios_aceptacion", []):
-                doc.add_paragraph(f"CA: {ca}", style="List Bullet")
-    else:
-        doc.add_paragraph("No se generaron historias de usuario.")
+    # 3. Historias de usuario
+    doc.add_heading("3. Historias de usuario", level=2)
+    historias = datos_qa.get("historias_de_usuario", []) or []
+    for hu in historias:
+        hu_id = hu.get("id", "HU")
+        titulo = hu.get("titulo", "")
+        doc.add_heading(f"{hu_id} — {titulo}".strip(" —"), level=3)
+        doc.add_paragraph(str(hu.get("descripcion", "")))
+        criterios = hu.get("criterios_aceptacion", []) or []
+        if criterios:
+            doc.add_paragraph("Criterios de aceptación:")
+            for crit in criterios:
+                doc.add_paragraph(str(crit), style="List Bullet")
 
-    # 3. Casos de Prueba por Tipo
-    doc.add_heading("3. Casos de Prueba", level=2)
-    casos = datos_qa.get("casos_de_prueba", {})
-    categorias = [
-        ("humo", "Pruebas de Humo (Smoke)"),
-        ("funcionales", "Pruebas Funcionales"),
-        ("regresion", "Pruebas de Regresión"),
-        ("automatizacion", "Pruebas Candidatas a Automatización"),
-    ]
+    # 4. Casos de prueba
+    casos = datos_qa.get("casos_de_prueba", {}) or {}
+    doc.add_heading("4. Casos de prueba", level=2)
 
-    for clave, etiqueta in categorias:
-        doc.add_heading(etiqueta, level=3)
-        lista_casos = casos.get(clave, [])
-        if not lista_casos:
-            doc.add_paragraph("Sin casos registrados en esta categoría.")
-            continue
+    doc.add_heading("Pruebas de humo", level=3)
+    _agregar_tabla_casos(doc, casos.get("humo", []), es_automatizacion=False)
 
-        tabla = doc.add_table(rows=1, cols=3)
-        tabla.style = "Table Grid"
-        encabezados = tabla.rows[0].cells
-        encabezados[0].text = "ID"
-        encabezados[1].text = "Escenario / Detalle"
-        encabezados[2].text = "Resultado Esperado / Automatización"
+    doc.add_heading("Pruebas funcionales", level=3)
+    _agregar_tabla_casos(doc, casos.get("funcionales", []), es_automatizacion=False)
 
-        for caso in lista_casos:
-            fila = tabla.add_row().cells
-            fila[0].text = str(caso.get("id", ""))
-            fila[1].text = str(caso.get("escenario", ""))
+    doc.add_heading("Pruebas de regresión", level=3)
+    _agregar_tabla_casos(doc, casos.get("regresion", []), es_automatizacion=False)
 
-            extra = str(caso.get("resultado_esperado", ""))
-            if caso.get("candidato_porque"):
-                extra = f"{extra} | Motivo auto: {caso['candidato_porque']}".strip(" |")
-            fila[2].text = extra
+    doc.add_heading("Pruebas candidatas a automatización", level=3)
+    _agregar_tabla_casos(
+        doc, casos.get("automatizacion", []), es_automatizacion=True
+    )
 
-    ruta_final = Path(ruta_salida_docx)
-    ruta_final.parent.mkdir(parents=True, exist_ok=True)
-    doc.save(ruta_final)
-    return ruta_final
+    ruta = Path(ruta_salida)
+    ruta.parent.mkdir(parents=True, exist_ok=True)
+    doc.save(str(ruta))

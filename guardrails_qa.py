@@ -1,109 +1,123 @@
 from pathlib import Path
+from typing import Callable
+
+
+def _a_lista_strings(valor: object) -> list[str]:
+    if isinstance(valor, list):
+        return [str(x).strip() for x in valor if str(x).strip()]
+    if isinstance(valor, str) and valor.strip():
+        return [valor.strip()]
+    return []
 
 
 def normalizar_y_validar_qa(datos: dict | None) -> dict:
-    """Valida y normaliza la estructura JSON generada por el LLM antes de exportar."""
-    if not isinstance(datos, dict):
-        datos = {}
+    """Normaliza la estructura QA garantizando claves, IDs y campos mínimos."""
+    base = datos if isinstance(datos, dict) else {}
 
-    refinamiento = datos.get("refinamiento")
-    if not isinstance(refinamiento, dict):
-        refinamiento = {}
+    refinamiento_raw = base.get("refinamiento")
+    refinamiento_dict = refinamiento_raw if isinstance(refinamiento_raw, dict) else {}
 
-    obs = refinamiento.get("observaciones_criticas")
-    if not isinstance(obs, list):
-        obs = [str(obs)] if obs else []
-    obs_limpias = [str(x).strip() for x in obs if str(x).strip()]
+    refinamiento = {
+        "observaciones_criticas": _a_lista_strings(
+            refinamiento_dict.get("observaciones_criticas")
+        ),
+        "preguntas_escalamiento": _a_lista_strings(
+            refinamiento_dict.get("preguntas_escalamiento")
+        ),
+    }
 
-    pregs = refinamiento.get("preguntas_escalamiento")
-    if not isinstance(pregs, list):
-        pregs = [str(pregs)] if pregs else []
-    pregs_limpias = [str(x).strip() for x in pregs if str(x).strip()]
+    hus_raw = base.get("historias_de_usuario")
+    hus_list = hus_raw if isinstance(hus_raw, list) else []
+    historias_normalizadas: list[dict] = []
 
-    hus_raw = datos.get("historias_de_usuario")
-    if not isinstance(hus_raw, list):
-        hus_raw = []
-    hus_limpias: list[dict] = []
-    for idx, hu in enumerate(hus_raw, start=1):
+    for idx, hu in enumerate(hus_list, start=1):
         if not isinstance(hu, dict):
             continue
-        ca_raw = hu.get("criterios_aceptacion", [])
-        if not isinstance(ca_raw, list):
-            ca_raw = [str(ca_raw)] if ca_raw else []
-        hus_limpias.append(
+        hu_id = str(hu.get("id") or f"HU-{idx:02d}").strip()
+        titulo = str(hu.get("titulo") or f"Historia de usuario {idx}").strip()
+        descripcion = str(
+            hu.get("descripcion")
+            or "Como usuario del sistema, quiero ejecutar el flujo requerido, para cumplir el objetivo del negocio."
+        ).strip()
+        criterios = _a_lista_strings(hu.get("criterios_aceptacion"))
+        historias_normalizadas.append(
             {
-                "id": str(hu.get("id") or f"HU-{idx:02d}").strip(),
-                "titulo": str(hu.get("titulo") or "Historia de Usuario sin título").strip(),
-                "descripcion": str(hu.get("descripcion") or "").strip(),
+                "id": hu_id,
+                "titulo": titulo,
+                "descripcion": descripcion,
+                "criterios_aceptacion": criterios,
+            }
+        )
+
+    if not historias_normalizadas:
+        historias_normalizadas.append(
+            {
+                "id": "HU-01",
+                "titulo": "Flujo principal del requerimiento",
+                "descripcion": "Como analista u operador del sistema, quiero procesar el requerimiento según sus reglas de negocio, para garantizar una operación confiable y trazable.",
                 "criterios_aceptacion": [
-                    str(c).strip() for c in ca_raw if str(c).strip()
+                    "Validar operación correcta bajo condiciones normales y reglas del dominio.",
+                    "Validar manejo controlado de errores y preservación de trazabilidad.",
                 ],
             }
         )
 
-    casos_raw = datos.get("casos_de_prueba")
-    if not isinstance(casos_raw, dict):
-        casos_raw = {}
+    casos_raw = base.get("casos_de_prueba")
+    casos_dict = casos_raw if isinstance(casos_raw, dict) else {}
 
     def _normalizar_lista_casos(
-        lista_entrada: object, prefijo: str, incluir_auto: bool = False
+        items: object, prefijo: str, incluir_motivo_auto: bool = False
     ) -> list[dict]:
-        if not isinstance(lista_entrada, list):
-            return []
+        lista_in = items if isinstance(items, list) else []
         salida: list[dict] = []
-        for idx, item in enumerate(lista_entrada, start=1):
+        for idx, item in enumerate(lista_in, start=1):
             if not isinstance(item, dict):
                 continue
             escenario = str(item.get("escenario") or "").strip()
             resultado = str(item.get("resultado_esperado") or "").strip()
             if not escenario and not resultado:
                 continue
-            caso: dict[str, str] = {
+            caso = {
                 "id": str(item.get("id") or f"{prefijo}-{idx:02d}").strip(),
-                "escenario": escenario,
-                "resultado_esperado": resultado,
+                "escenario": escenario or "Validar escenario del requerimiento.",
+                "resultado_esperado": resultado
+                or "El sistema responde conforme a la regla esperada sin errores.",
             }
-            if incluir_auto:
+            if incluir_motivo_auto:
                 caso["candidato_porque"] = str(
                     item.get("candidato_porque")
-                    or "Prueba repetitiva o crítica candidata a automatización."
+                    or "Alta repetitividad y valor para regresión continua."
                 ).strip()
             salida.append(caso)
         return salida
 
+    casos_normalizados = {
+        "humo": _normalizar_lista_casos(casos_dict.get("humo"), "SMK"),
+        "funcionales": _normalizar_lista_casos(casos_dict.get("funcionales"), "FNC"),
+        "regresion": _normalizar_lista_casos(casos_dict.get("regresion"), "REG"),
+        "automatizacion": _normalizar_lista_casos(
+            casos_dict.get("automatizacion"), "AUT", incluir_motivo_auto=True
+        ),
+    }
+
     return {
-        "refinamiento": {
-            "observaciones_criticas": obs_limpias,
-            "preguntas_escalamiento": pregs_limpias,
-        },
-        "historias_de_usuario": hus_limpias,
-        "casos_de_prueba": {
-            "humo": _normalizar_lista_casos(casos_raw.get("humo"), "SMK"),
-            "funcionales": _normalizar_lista_casos(casos_raw.get("funcionales"), "FNC"),
-            "regresion": _normalizar_lista_casos(casos_raw.get("regresion"), "REG"),
-            "automatizacion": _normalizar_lista_casos(
-                casos_raw.get("automatizacion"), "AUT", incluir_auto=True
-            ),
-        },
+        "refinamiento": refinamiento,
+        "historias_de_usuario": historias_normalizadas,
+        "casos_de_prueba": casos_normalizados,
     }
 
 
 def guardar_docx_seguro(
-    datos_estructurados: dict, ruta_docx: Path, exportador_fn
+    datos_qa: dict,
+    ruta_docx: Path,
+    exportar_fn: Callable[[dict, str], None],
 ) -> Path | None:
-    """Guarda el .docx y, si está bloqueado por Word, lo guarda con un nombre alternativo."""
+    """Exporta el Word de forma segura y evita fallos si el archivo está abierto."""
+    ruta_docx.parent.mkdir(parents=True, exist_ok=True)
     try:
-        exportador_fn(datos_estructurados, str(ruta_docx))
+        exportar_fn(datos_qa, str(ruta_docx))
         return ruta_docx
     except PermissionError:
-        ruta_alternativa = ruta_docx.with_name(f"{ruta_docx.stem}_nuevo.docx")
-        print(
-            f"Aviso: '{ruta_docx.name}' está abierto o bloqueado. "
-            f"Guardando en '{ruta_alternativa.name}'..."
-        )
-        try:
-            exportador_fn(datos_estructurados, str(ruta_alternativa))
-            return ruta_alternativa
-        except Exception as exc:
-            print(f"No se pudo guardar el documento Word: {exc}")
-            return None
+        ruta_alterna = ruta_docx.with_name(f"{ruta_docx.stem}_nuevo{ruta_docx.suffix}")
+        exportar_fn(datos_qa, str(ruta_alterna))
+        return ruta_alterna
