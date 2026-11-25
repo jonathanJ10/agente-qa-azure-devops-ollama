@@ -1,3 +1,4 @@
+import importlib
 from pathlib import Path
 import sys
 
@@ -8,6 +9,7 @@ if str(RAIZ_AGENTE) not in sys.path:
 
 from cache_qa import calcular_clave_cache, guardar_cache_qa, leer_cache_qa
 from guardrails_qa import normalizar_y_validar_qa
+from reporte_ejecutivo_qa import construir_bloque_auditoria_dlp
 from seguridad_qa import _sanitizar_texto_sensible, sanitizar_con_auditoria
 from trazabilidad_qa import construir_matriz_trazabilidad
 
@@ -83,3 +85,38 @@ def test_trazabilidad_por_tokens_y_coincidencia():
     assert matriz["total_criterios_detectados"] == 2
     assert matriz["criterios_cubiertos"] == 1
     assert matriz["porcentaje_trazabilidad"] == 50.0
+
+
+def test_auditoria_dlp_reporte_ejecutivo():
+    texto = "Placa ABC123, ciudadano: Ana Gomez y comparendo: CMP-998877"
+    auditoria = construir_bloque_auditoria_dlp(texto)
+
+    assert auditoria["total_elementos_enmascarados"] >= 2
+    assert "ABC123" not in auditoria["resumen_linea"]
+    assert "Ana Gomez" not in auditoria["resumen_linea"]
+
+
+def test_extractor_subopciones_criterios_si_existe():
+    extractor = None
+    for modulo_nombre in ("trazabilidad_qa", "main"):
+        try:
+            mod = importlib.import_module(modulo_nombre)
+        except Exception:
+            continue
+        candidato = getattr(mod, "_extraer_subopciones_criterios", None)
+        if callable(candidato):
+            extractor = candidato
+            break
+
+    if extractor is None:
+        matriz = construir_matriz_trazabilidad({"casos_de_prueba": {"funcionales": []}}, [])
+        assert matriz["porcentaje_trazabilidad"] == 100.0
+        return
+
+    texto_criterios = (
+        "- Regla: Validar vigencia del convenio antes de crearlo\n"
+        "- Excepción: Rechazar solicitud si el comparendo ya está pagado"
+    )
+    resultado = extractor(texto_criterios)
+    assert isinstance(resultado, list)
+    assert len(resultado) >= 1

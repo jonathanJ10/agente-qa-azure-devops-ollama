@@ -51,10 +51,10 @@ Responde ÚNICAMENTE con un JSON válido (sin markdown ni texto extra):
 """
 
 PROMPT_CASOS = """
-Eres un Arquitecto Senior de QA en movilidad y tránsito enfocado en diseñar casos de prueba completos y accionables.
+Eres un Arquitecto Senior de QA en movilidad y tránsito enfocado en diseñar casos de prueba completos, formales y accionables.
 A partir del requerimiento y las historias/criterios Gherkin recibidos, genera:
 - "humo": 2 a 3 casos de acceso, disponibilidad del módulo, permisos básicos y carga inicial sin errores.
-- "funcionales": casos claros y detallados cubriendo camino feliz, reglas de negocio/estados/convenios/vigencias, validaciones de campos/errores/excepciones, valores límite y restricciones de rol/auditoría.
+- "funcionales": casos claros y detallados aplicando técnicas ISTQB (partición de equivalencia, análisis de valores límite en montos/fechas/plazos de convenio, transición de estados, tablas de decisión y autorización por rol), cubriendo camino feliz, reglas de negocio/vigencias/convenios, validaciones de error/excepción y trazabilidad/auditoría.
 - "regresion": 2 a 3 casos de no afectación a módulos relacionados, consistencia de estados/datos y trazabilidad.
 - "automatizacion": 2 a 3 casos repetitivos, de regresión o de reglas críticas, indicando en "candidato_porque" el motivo técnico breve.
 

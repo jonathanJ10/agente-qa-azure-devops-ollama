@@ -1,4 +1,20 @@
 from pathlib import Path
+from seguridad_qa import sanitizar_con_auditoria
+
+
+def construir_bloque_auditoria_dlp(texto_fuente: str) -> dict:
+    """Genera un resumen de auditoría DLP sin revelar valores sensibles originales."""
+    _, conteo = sanitizar_con_auditoria(texto_fuente or "")
+    total_ocultos = sum(conteo.values())
+    desglose = {k: v for k, v in conteo.items() if v > 0}
+    return {
+        "total_elementos_enmascarados": total_ocultos,
+        "desglose_por_categoria": desglose,
+        "resumen_linea": (
+            f"Auditoría DLP: {total_ocultos} elemento(s) sensible(s) enmascarado(s) "
+            f"({', '.join(f'{k}={v}' for k, v in desglose.items()) if desglose else 'sin hallazgos'})."
+        ),
+    }
 
 
 def generar_resumen_ejecutivo_md(
