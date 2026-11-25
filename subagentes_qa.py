@@ -1,4 +1,5 @@
 import json
+import time
 from pathlib import Path
 from typing import Callable
 
@@ -72,7 +73,36 @@ Responde ÚNICAMENTE con un JSON válido (sin markdown ni texto extra):
 """
 
 
-def _ejecutar_etapa_con_cache(
+def _es_salida_etapa_valida(etapa: str, datos: dict | None) -> bool:
+    """Valida que la salida de cada subagente cumpla un contrato mínimo antes de cachear."""
+    if not isinstance(datos, dict) or not datos:
+        return False
+
+    if etapa == "refinamiento":
+        obs = datos.get("observaciones_criticas")
+        pregs = datos.get("preguntas_escalamiento")
+        return bool(
+            (isinstance(obs, list) and len(obs) > 0)
+            or (isinstance(pregs, list) and len(pregs) > 0)
+        )
+
+    if etapa == "historias":
+        hus = datos.get("historias_de_usuario")
+        return isinstance(hus, list) and len(hus) > 0 and any(isinstance(h, dict) for h in hus)
+
+    if etapa == "casos_prueba":
+        casos = datos.get("casos_de_prueba")
+        if not isinstance(casos, dict):
+            return False
+        return any(
+            isinstance(casos.get(clave), list) and len(casos.get(clave)) > 0
+            for clave in ("humo", "funcionales", "regresion", "automatizacion")
+        )
+
+    return True
+
+
+def _ejecutar_etapa_detallada(
     etapa: str,
     prompt_usuario: str,
     system_prompt: str,
@@ -83,7 +113,8 @@ def _ejecutar_etapa_con_cache(
     extraer_json_fn: Callable[[str], dict | None],
     modelo_fallback: str = "llama3.2:3b",
     timeout: int = 600,
-) -> tuple[dict | None, str]:
+) -> tuple[dict | None, str, dict]:
+    inicio = time.perf_counter()
     prompt_seguro = _sanitizar_texto_sensible(prompt_usuario)
     rag_seguro = _sanitizar_texto_sensible(contexto_rag)
 
@@ -94,8 +125,14 @@ def _ejecutar_etapa_con_cache(
     )
     cacheado = leer_cache_qa(carpeta_cache, clave)
     if isinstance(cacheado, dict) and cacheado:
-        print(f"  [Subagente:{etapa}] Cache hit ({clave[:8]}...).")
-        return cacheado, modelo
+        duracion = round(time.perf_counter() - inicio, 3)
+        print(f"  [Subagente:{etapa}] Cache hit ({clave[:8]}...) en {duracion}s.")
+        return cacheado, modelo, {
+            "etapa": etapa,
+            "cache_hit": True,
+            "modelo_efectivo": modelo,
+            "duracion_s": duracion,
+        }
 
     print(f"  [Subagente:{etapa}] Ejecutando con {modelo}...")
     extraido, modelo_efectivo, info = ejecutar_llm_con_resiliencia(
@@ -108,12 +145,51 @@ def _ejecutar_etapa_con_cache(
         timeout=timeout,
         max_reintentos_por_modelo=0,
     )
-    if isinstance(extraido, dict) and extraido:
+    duracion = round(time.perf_counter() - inicio, 3)
+    if _es_salida_etapa_valida(etapa, extraido):
         guardar_cache_qa(carpeta_cache, clave, extraido)
-        return extraido, modelo_efectivo
+        return extraido, modelo_efectivo, {
+            "etapa": etapa,
+            "cache_hit": False,
+            "modelo_efectivo": modelo_efectivo,
+            "duracion_s": duracion,
+        }
 
     print(f"  [Subagente:{etapa}] Sin resultado válido ({info.get('ultimo_error', '')}).")
-    return None, modelo_efectivo
+    return None, modelo_efectivo, {
+        "etapa": etapa,
+        "cache_hit": False,
+        "modelo_efectivo": modelo_efectivo,
+        "duracion_s": duracion,
+        "error": info.get("ultimo_error", ""),
+    }
+
+
+def _ejecutar_etapa_con_cache(
+    etapa: str,
+    prompt_usuario: str,
+    system_prompt: str,
+    contexto_rag: str,
+    modelo: str,
+    carpeta_cache: Path,
+    preguntar_fn: Callable[..., str],
+    extraer_json_fn: Callable[[str], dict | None],
+    modelo_fallback: str = "llama3.2:3b",
+    timeout: int = 600,
+) -> tuple[dict | None, str]:
+    datos, modelo_efectivo, _ = _ejecutar_etapa_detallada(
+        etapa=etapa,
+        prompt_usuario=prompt_usuario,
+        system_prompt=system_prompt,
+        contexto_rag=contexto_rag,
+        modelo=modelo,
+        carpeta_cache=carpeta_cache,
+        preguntar_fn=preguntar_fn,
+        extraer_json_fn=extraer_json_fn,
+        modelo_fallback=modelo_fallback,
+        timeout=timeout,
+    )
+    return datos, modelo_efectivo
 
 
 def ejecutar_orquestacion_subagentes_qa(
@@ -127,7 +203,8 @@ def ejecutar_orquestacion_subagentes_qa(
     extraer_json_fn: Callable[[str], dict | None],
     timeout: int = 600,
 ) -> tuple[dict | None, str]:
-    """Orquesta subagentes especializados preservando criterios extensos y evitando reintentos lentos."""
+    """Orquesta subagentes especializados preservando criterios extensos y telemetría por etapa."""
+    inicio_total = time.perf_counter()
     req_compacto = resumir_contexto_seguro(contenido_req, max_chars=3800)
     rag_compacto = resumir_contexto_seguro(contexto_rag, max_chars=1000)
 
@@ -136,7 +213,7 @@ def ejecutar_orquestacion_subagentes_qa(
         f"POLÍTICAS QA:\n{rag_compacto}\n\n"
         f"REQUERIMIENTO ({tipo_fuente.upper()}):\n{req_compacto}"
     )
-    ref_data, modelo_ref = _ejecutar_etapa_con_cache(
+    ref_data, modelo_ref, met_ref = _ejecutar_etapa_detallada(
         etapa="refinamiento",
         prompt_usuario=prompt_ref,
         system_prompt=PROMPT_REFINAMIENTO,
@@ -159,7 +236,7 @@ def ejecutar_orquestacion_subagentes_qa(
         f"REQUERIMIENTO ({tipo_fuente.upper()}):\n{req_compacto}\n\n"
         f"REFINAMIENTO:\n{ref_json_compacto}"
     )
-    hu_data, modelo_hu = _ejecutar_etapa_con_cache(
+    hu_data, modelo_hu, met_hu = _ejecutar_etapa_detallada(
         etapa="historias",
         prompt_usuario=prompt_hu,
         system_prompt=PROMPT_HISTORIAS,
@@ -192,7 +269,7 @@ def ejecutar_orquestacion_subagentes_qa(
         f"REQUERIMIENTO ({tipo_fuente.upper()}):\n{req_compacto}\n\n"
         f"HISTORIAS Y CRITERIOS:\n{hu_compacto}"
     )
-    casos_data, modelo_casos = _ejecutar_etapa_con_cache(
+    casos_data, modelo_casos, met_casos = _ejecutar_etapa_detallada(
         etapa="casos_prueba",
         prompt_usuario=prompt_casos,
         system_prompt=PROMPT_CASOS,
@@ -208,6 +285,15 @@ def ejecutar_orquestacion_subagentes_qa(
     if not any([ref_data, hu_data, casos_data]):
         return None, modelo_casos or modelo_hu or modelo_ref
 
+    metricas_etapas = [met_ref, met_hu, met_casos]
+    hits = sum(1 for m in metricas_etapas if m.get("cache_hit"))
+    if hits == len(metricas_etapas):
+        estado_cache = "full_hit"
+    elif hits > 0:
+        estado_cache = "partial_hit"
+    else:
+        estado_cache = "miss"
+
     consolidado: dict = {
         "refinamiento": {
             "observaciones_criticas": (ref_data or {}).get("observaciones_criticas", []),
@@ -215,6 +301,13 @@ def ejecutar_orquestacion_subagentes_qa(
         },
         "historias_de_usuario": (hu_data or {}).get("historias_de_usuario", []),
         "casos_de_prueba": (casos_data or {}).get("casos_de_prueba", {}),
+        "_telemetria_subagentes": {
+            "estado_cache": estado_cache,
+            "cache_hits": hits,
+            "total_etapas": len(metricas_etapas),
+            "duracion_total_s": round(time.perf_counter() - inicio_total, 3),
+            "etapas": metricas_etapas,
+        },
     }
 
     modelo_reportado = modelo_casos or modelo_hu or modelo_ref

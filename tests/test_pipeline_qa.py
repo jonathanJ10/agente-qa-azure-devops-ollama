@@ -11,6 +11,7 @@ from cache_qa import calcular_clave_cache, guardar_cache_qa, leer_cache_qa
 from guardrails_qa import normalizar_y_validar_qa
 from reporte_ejecutivo_qa import construir_bloque_auditoria_dlp
 from seguridad_qa import _sanitizar_texto_sensible, sanitizar_con_auditoria
+from subagentes_qa import _es_salida_etapa_valida, ejecutar_orquestacion_subagentes_qa
 from trazabilidad_qa import construir_matriz_trazabilidad
 
 
@@ -60,7 +61,8 @@ def test_guardrails_garantiza_casos_de_humo_y_estructura():
 
     assert len(normalizado["historias_de_usuario"]) >= 1
     assert len(normalizado["casos_de_prueba"]["humo"]) >= 2
-    assert len(normalizado["casos_de_prueba"]["funcionales"]) == 1
+    assert len(normalizado["casos_de_prueba"]["funcionales"]) >= 3
+    assert normalizado["casos_de_prueba"]["funcionales"][0]["id"] == "FNC-01"
 
 
 def test_trazabilidad_por_tokens_y_coincidencia():
@@ -120,3 +122,93 @@ def test_extractor_subopciones_criterios_si_existe():
     resultado = extractor(texto_criterios)
     assert isinstance(resultado, list)
     assert len(resultado) >= 1
+
+
+def test_validacion_contrato_etapas_y_telemetria_cache(tmp_path: Path):
+    assert _es_salida_etapa_valida("refinamiento", {}) is False
+    assert _es_salida_etapa_valida("historias", {"historias_de_usuario": []}) is False
+    assert (
+        _es_salida_etapa_valida(
+            "casos_prueba",
+            {"casos_de_prueba": {"funcionales": [{"id": "FNC-01", "escenario": "Caso base"}]}},
+        )
+        is True
+    )
+
+    def fake_preguntar(*args, **kwargs):
+        return "{}"
+
+    def fake_extraer_json(raw: str):
+        if '"observaciones_criticas"' in raw:
+            return {"observaciones_criticas": ["Obs 1"], "preguntas_escalamiento": []}
+        if '"historias_de_usuario"' in raw:
+            return {
+                "historias_de_usuario": [
+                    {
+                        "id": "HU-01",
+                        "titulo": "Convenio",
+                        "descripcion": "Como analista quiero validar convenio para cumplir regla",
+                        "criterios_aceptacion": ["Dado convenio activo, cuando valida, entonces aprueba"],
+                    }
+                ]
+            }
+        return {
+            "casos_de_prueba": {
+                "humo": [{"id": "SMK-01", "escenario": "Smoke", "resultado_esperado": "OK"}],
+                "funcionales": [{"id": "FNC-01", "escenario": "Func", "resultado_esperado": "OK"}],
+                "regresion": [{"id": "REG-01", "escenario": "Reg", "resultado_esperado": "OK"}],
+                "automatizacion": [
+                    {
+                        "id": "AUT-01",
+                        "escenario": "Auto",
+                        "candidato_porque": "Repetitivo",
+                        "resultado_esperado": "OK",
+                    }
+                ],
+            }
+        }
+
+    def preguntar_por_etapa(prompt: str, system_prompt: str = "", **kwargs):
+        if "observaciones_criticas" in system_prompt:
+            return '{"observaciones_criticas": ["Obs 1"], "preguntas_escalamiento": ["P1"]}'
+        if "historias_de_usuario" in system_prompt:
+            return (
+                '{"historias_de_usuario": [{"id": "HU-01", "titulo": "Convenio", '
+                '"descripcion": "Como analista quiero validar convenio para cumplir regla", '
+                '"criterios_aceptacion": ["Dado convenio activo, cuando valida, entonces aprueba"]}]}'
+            )
+        return (
+            '{"casos_de_prueba": {"humo": [{"id": "SMK-01", "escenario": "Smoke", "resultado_esperado": "OK"}], '
+            '"funcionales": [{"id": "FNC-01", "escenario": "Func", "resultado_esperado": "OK"}], '
+            '"regresion": [{"id": "REG-01", "escenario": "Reg", "resultado_esperado": "OK"}], '
+            '"automatizacion": [{"id": "AUT-01", "escenario": "Auto", "candidato_porque": "Repetitivo", "resultado_esperado": "OK"}]}}'
+        )
+
+    import json as _json
+
+    consolidado_miss, _ = ejecutar_orquestacion_subagentes_qa(
+        contenido_req="Requerimiento de convenio SIMIT",
+        contexto_rag="Política QA",
+        tipo_fuente="xlsx",
+        modelo_principal="llama3",
+        modelo_rapido="llama3.2:3b",
+        carpeta_cache=tmp_path,
+        preguntar_fn=preguntar_por_etapa,
+        extraer_json_fn=lambda s: _json.loads(s),
+    )
+    assert consolidado_miss is not None
+    assert consolidado_miss["_telemetria_subagentes"]["estado_cache"] == "miss"
+
+    consolidado_hit, _ = ejecutar_orquestacion_subagentes_qa(
+        contenido_req="Requerimiento de convenio SIMIT",
+        contexto_rag="Política QA",
+        tipo_fuente="xlsx",
+        modelo_principal="llama3",
+        modelo_rapido="llama3.2:3b",
+        carpeta_cache=tmp_path,
+        preguntar_fn=fake_preguntar,
+        extraer_json_fn=fake_extraer_json,
+    )
+    assert consolidado_hit is not None
+    assert consolidado_hit["_telemetria_subagentes"]["estado_cache"] == "full_hit"
+    assert consolidado_hit["_telemetria_subagentes"]["cache_hits"] == 3

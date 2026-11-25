@@ -10,8 +10,109 @@ def _a_lista_strings(valor: object) -> list[str]:
     return []
 
 
+def _completar_cobertura_istqb_funcional(funcionales: list[dict]) -> list[dict]:
+    """Completa de forma determinista huecos ISTQB críticos sin alterar casos existentes."""
+    salida = list(funcionales)
+    texto_existente = " ".join(
+        f"{c.get('escenario', '')} {c.get('resultado_esperado', '')}".lower()
+        for c in salida
+    )
+    ids_existentes = {str(c.get("id", "")).strip() for c in salida}
+
+    def _siguiente_id_fnc() -> str:
+        n = len(salida) + 1
+        while f"FNC-{n:02d}" in ids_existentes:
+            n += 1
+        ids_existentes.add(f"FNC-{n:02d}")
+        return f"FNC-{n:02d}"
+
+    # 1. Partición de equivalencia negativa / excepción controlada
+    palabras_negativas = (
+        "inválid",
+        "invalido",
+        "rechaz",
+        "error",
+        "excep",
+        "bloque",
+        "vencid",
+        "no existe",
+        "inexistente",
+    )
+    if salida and not any(p in texto_existente for p in palabras_negativas):
+        salida.append(
+            {
+                "id": _siguiente_id_fnc(),
+                "escenario": (
+                    "Partición inválida / excepción: ejecutar el flujo con datos fuera de regla, "
+                    "estado no permitido o referencia inexistente."
+                ),
+                "resultado_esperado": (
+                    "El sistema rechaza la operación de forma controlada, no altera el estado "
+                    "y registra el motivo de rechazo."
+                ),
+            }
+        )
+
+    # 2. Análisis de valores límite / frontera (montos, fechas, plazos o cantidades)
+    palabras_limite = (
+        "límite",
+        "limite",
+        "frontera",
+        "mínimo",
+        "minimo",
+        "máximo",
+        "maximo",
+        "plazo",
+        "vigencia",
+        "monto",
+        "cuota",
+        "cero",
+    )
+    if salida and not any(p in texto_existente for p in palabras_limite):
+        salida.append(
+            {
+                "id": _siguiente_id_fnc(),
+                "escenario": (
+                    "Valores límite / frontera: evaluar el comportamiento en los bordes permitidos "
+                    "y justo fuera de ellos (montos, fechas/vigencias o plazos de convenio)."
+                ),
+                "resultado_esperado": (
+                    "Los valores dentro del límite válido son aceptados y los valores en el borde "
+                    "inválido o vencido son controlados según regla de negocio."
+                ),
+            }
+        )
+
+    # 3. Autorización / control de acceso por rol
+    palabras_rol = (
+        "rol",
+        "permiso",
+        "autoriz",
+        "acceso",
+        "no autorizado",
+        "privilegio",
+        "auditor",
+    )
+    if salida and not any(p in texto_existente for p in palabras_rol):
+        salida.append(
+            {
+                "id": _siguiente_id_fnc(),
+                "escenario": (
+                    "Autorización por rol: validar que un usuario sin permisos suficientes intente "
+                    "ejecutar o modificar una operación restringida del flujo."
+                ),
+                "resultado_esperado": (
+                    "El sistema deniega el acceso por falta de permisos y deja registro de "
+                    "auditoría sin ejecutar la acción."
+                ),
+            }
+        )
+
+    return salida
+
+
 def normalizar_y_validar_qa(datos: dict | None) -> dict:
-    """Normaliza la estructura QA garantizando claves, IDs y campos mínimos."""
+    """Normaliza la estructura QA garantizando claves, IDs, campos mínimos y cobertura ISTQB."""
     base = datos if isinstance(datos, dict) else {}
 
     refinamiento_raw = base.get("refinamiento")
@@ -112,20 +213,28 @@ def normalizar_y_validar_qa(datos: dict | None) -> dict:
             if base_caso["id"] not in ids_existentes:
                 humo_normalizado.append(base_caso)
 
+    funcionales_normalizados = _completar_cobertura_istqb_funcional(
+        _normalizar_lista_casos(casos_dict.get("funcionales"), "FNC")
+    )
+
     casos_normalizados = {
         "humo": humo_normalizado,
-        "funcionales": _normalizar_lista_casos(casos_dict.get("funcionales"), "FNC"),
+        "funcionales": funcionales_normalizados,
         "regresion": _normalizar_lista_casos(casos_dict.get("regresion"), "REG"),
         "automatizacion": _normalizar_lista_casos(
             casos_dict.get("automatizacion"), "AUT", incluir_motivo_auto=True
         ),
     }
 
-    return {
+    resultado_final: dict = {
         "refinamiento": refinamiento,
         "historias_de_usuario": historias_normalizadas,
         "casos_de_prueba": casos_normalizados,
     }
+    if "_telemetria_subagentes" in base and isinstance(base["_telemetria_subagentes"], dict):
+        resultado_final["_telemetria_subagentes"] = base["_telemetria_subagentes"]
+
+    return resultado_final
 
 
 def guardar_docx_seguro(

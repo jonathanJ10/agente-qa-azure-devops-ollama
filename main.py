@@ -19,7 +19,7 @@ from observabilidad_evals import (
 )
 from reporte_ejecutivo_qa import generar_resumen_ejecutivo_md, imprimir_resumen_consola
 from reranker_rag import preparar_texto_por_secciones, rerank_fragmentos_rag
-from seguridad_qa import _sanitizar_texto_sensible
+from seguridad_qa import _sanitizar_texto_sensible, envolver_datos_no_confiables
 from subagentes_qa import ejecutar_orquestacion_subagentes_qa
 from trazabilidad_qa import construir_matriz_trazabilidad
 
@@ -298,6 +298,38 @@ def _parsear_ids_desde_texto(texto: str) -> list[int]:
     return ids
 
 
+def _seleccionar_archivo_entrada(carpeta_entradas: Path, archivo_por_defecto: str) -> str:
+    """Permite elegir entre archivos en entradas/ o usar el archivo predeterminado."""
+    if not carpeta_entradas.exists():
+        return archivo_por_defecto
+
+    archivos = sorted(
+        [
+            p.name
+            for p in carpeta_entradas.iterdir()
+            if p.is_file() and not p.name.startswith("~$") and p.suffix.lower() in {".xlsx", ".docx", ".pdf", ".txt", ".md"}
+        ]
+    )
+    if len(archivos) <= 1:
+        return archivos[0] if archivos else archivo_por_defecto
+
+    print("\nArchivos disponibles en entradas/:")
+    for idx, nombre in enumerate(archivos, start=1):
+        marca = " (predeterminado)" if nombre == archivo_por_defecto else ""
+        print(f"  {idx}. {nombre}{marca}")
+
+    elegido = input(
+        f"Elige un número o escribe el nombre (Enter para '{archivo_por_defecto}'): "
+    ).strip()
+    if not elegido:
+        return archivo_por_defecto
+    if elegido.isdigit():
+        indice = int(elegido) - 1
+        if 0 <= indice < len(archivos):
+            return archivos[indice]
+    return elegido
+
+
 def _procesar_y_guardar_qa(
     contenido_req: str,
     tipo_fuente: str,
@@ -354,6 +386,13 @@ def _procesar_y_guardar_qa(
         if not extraido:
             print("Los subagentes no devolvieron una estructura válida.")
             return
+        telemetria = extraido.get("_telemetria_subagentes") or {}
+        if isinstance(telemetria, dict) and telemetria.get("cache_hits", 0) > 0:
+            desde_cache = True
+            print(
+                f"  [Telemetría] Estado caché subagentes: {telemetria.get('estado_cache')} "
+                f"({telemetria.get('cache_hits', 0)}/{telemetria.get('total_etapas', 0)} etapas)."
+            )
         datos_estructurados = normalizar_y_validar_qa(extraido)
         datos_estructurados = _completar_casos_funcionales_desde_criterios(
             datos_estructurados, contenido_seguro, incluir_excepcion=True
@@ -362,12 +401,14 @@ def _procesar_y_guardar_qa(
             datos_estructurados, minimo_por_tipo=2
         )
     else:
+        rag_bloque = envolver_datos_no_confiables("POLITICAS_QA_RAG", contexto_rag, max_chars=2500)
+        req_bloque = envolver_datos_no_confiables(
+            f"REQUERIMIENTO_{tipo_fuente}", contenido_seguro, max_chars=6000
+        )
         prompt_usuario = f"""
-POLÍTICAS INTERNAS DE QA (RAG):
-{contexto_rag}
+{rag_bloque}
 
-REQUERIMIENTO DEL CLIENTE ({tipo_fuente.upper()}):
-{contenido_seguro}
+{req_bloque}
 
 Analiza el requerimiento y genera el JSON solicitado aplicando las políticas de QA.
 """
@@ -635,7 +676,10 @@ if __name__ == "__main__":
     modo = input("Elige 1 o 2 (Enter para Azure DevOps): ").strip()
 
     if modo == "2":
-        archivo_prueba = "GP-FM-01 Requerimiento - Convenio de infracciones creadas.xlsx"
+        archivo_predeterminado = "GP-FM-01 Requerimiento - Convenio de infracciones creadas.xlsx"
+        archivo_prueba = _seleccionar_archivo_entrada(
+            Path(__file__).parent / "entradas", archivo_predeterminado
+        )
         ejecutar_pipeline_qa(archivo_prueba, modo_orquestacion=modo_llm)
     else:
         ejecutar_pipeline_qa_interactivo(top=10, modo_orquestacion=modo_llm)

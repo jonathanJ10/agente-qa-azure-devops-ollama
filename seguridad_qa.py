@@ -20,6 +20,7 @@ _PALABRAS_NO_PLACA = {
     "SAML",
     "RUNT",
     "SIMIT",
+    "SOAT",
     "POLCA",
     "CONVENIO",
     "COMPARENDO",
@@ -29,6 +30,8 @@ _PALABRAS_NO_PLACA = {
     "MOVILIDAD",
     "TRANSITO",
     "TRÁNSITO",
+    "TECNOMECANICA",
+    "TECNOMECÁNICA",
     "BOGOTA",
     "BOGOTÁ",
     "AZURE",
@@ -37,6 +40,8 @@ _PALABRAS_NO_PLACA = {
     "LLAMA3",
     "GITHUB",
     "VERCEL",
+    "PYTHON",
+    "PANDAS",
     "GHERKIN",
     "ISTQB",
     "SMOKE",
@@ -46,6 +51,9 @@ _PALABRAS_NO_PLACA = {
     "FUNCIONALES",
     "AUTOMATIZACION",
     "AUTOMATIZACIÓN",
+    "REGLA",
+    "EXCEPCION",
+    "EXCEPCIÓN",
 }
 
 
@@ -76,7 +84,7 @@ def sanitizar_con_auditoria(texto: str) -> tuple[str, dict[str, int]]:
 
     # 1. Credenciales / tokens / claves comunes
     _reemplazar_y_contar(
-        r"(?i)\b(?:bearer|token|api[_-]?key|secret|password|passwd|clave)\s*[:=]\s*[\w\-.~+/=]+",
+        r"(?i)\b(?:bearer|access[_-]?token|client[_-]?secret|api[_-]?key|token|secret|password|passwd|clave|pat)\s*[:=]\s*[\"']?[\w\-.~+/=]+[\"']?",
         "[CREDENCIAL_OCULTA]",
         "credenciales",
     )
@@ -148,12 +156,13 @@ def sanitizar_con_auditoria(texto: str) -> tuple[str, dict[str, int]]:
         "nombres_etiquetados",
     )
 
-    # 9. Mitigación básica de prompt injection dentro de requerimientos externos
+    # 9. Mitigación de prompt injection dentro de requerimientos externos
     patrones_inyeccion = [
-        r"(?i)ignora\s+(?:las\s+)?instrucciones\s+anteriores.*",
-        r"(?i)ignore\s+(?:all\s+)?previous\s+instructions.*",
+        r"(?i)(?:ignora|olvida|descarta)\s+(?:todas?\s+)?(?:las\s+)?instrucciones\s+anteriores.*",
+        r"(?i)(?:ignore|forget|disregard)\s+(?:all\s+)?previous\s+instructions.*",
         r"(?i)act[uú]a\s+como\s+(?:administrador|root|sistema|system).*",
-        r"(?i)muestra\s+(?:el\s+)?(?:system\s+prompt|prompt\s+del\s+sistema|token|clave).*",
+        r"(?i)(?:muestra|revela|imprime)\s+(?:el\s+|tu\s+)?(?:system\s+prompt|prompt\s+del\s+sistema|token|clave|configuraci[oó]n).*",
+        r"(?i)(?:reveal|show|print)\s+(?:your\s+)?(?:system\s+prompt|instructions|secret|token).*",
     ]
     for patron in patrones_inyeccion:
         _reemplazar_y_contar(patron, "[CONTENIDO_REQUERIMIENTO_SANITIZADO]", "inyeccion")
@@ -173,3 +182,14 @@ def resumir_contexto_seguro(texto: str, max_chars: int = 2200) -> str:
     if len(sanitizado) <= max_chars:
         return sanitizado
     return sanitizado[:max_chars].rstrip() + "\n...[contexto acotado para eficiencia]..."
+
+
+def envolver_datos_no_confiables(etiqueta: str, contenido: str, max_chars: int = 3800) -> str:
+    """Delimita datos externos sanitizados para tratarlos solo como entrada y no como órdenes."""
+    etiqueta_limpia = (etiqueta or "DATOS_EXTERNOS").strip().upper()
+    texto_seguro = resumir_contexto_seguro(contenido, max_chars=max_chars)
+    return (
+        f"<<<INICIO_{etiqueta_limpia}_SOLO_DATOS>>>\n"
+        f"{texto_seguro}\n"
+        f"<<<FIN_{etiqueta_limpia}_SOLO_DATOS>>>"
+    )
