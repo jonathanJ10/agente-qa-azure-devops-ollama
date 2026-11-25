@@ -56,8 +56,8 @@ def normalizar_y_validar_qa(datos: dict | None) -> dict:
                 "titulo": "Flujo principal del requerimiento",
                 "descripcion": "Como analista u operador del sistema, quiero procesar el requerimiento según sus reglas de negocio, para garantizar una operación confiable y trazable.",
                 "criterios_aceptacion": [
-                    "Validar operación correcta bajo condiciones normales y reglas del dominio.",
-                    "Validar manejo controlado de errores y preservación de trazabilidad.",
+                    "Dado un usuario autorizado, cuando ejecuta el flujo principal con datos válidos, entonces el sistema procesa la operación y registra trazabilidad.",
+                    "Dado datos inválidos o fuera de regla, cuando intenta procesar la operación, entonces el sistema bloquea el flujo y muestra un mensaje controlado.",
                 ],
             }
         )
@@ -91,8 +91,29 @@ def normalizar_y_validar_qa(datos: dict | None) -> dict:
             salida.append(caso)
         return salida
 
+    humo_normalizado = _normalizar_lista_casos(casos_dict.get("humo"), "SMK")
+    if len(humo_normalizado) < 2:
+        humo_base = [
+            {
+                "id": "SMK-01",
+                "escenario": "Verificar acceso autenticado y disponibilidad del módulo principal del requerimiento.",
+                "resultado_esperado": "El módulo carga correctamente sin errores HTTP ni bloqueos de sesión.",
+            },
+            {
+                "id": "SMK-02",
+                "escenario": "Verificar consulta o carga inicial de datos del requerimiento en estado operativo normal.",
+                "resultado_esperado": "La información se presenta de forma coherente y sin fallos críticos.",
+            },
+        ]
+        ids_existentes = {c["id"] for c in humo_normalizado}
+        for base_caso in humo_base:
+            if len(humo_normalizado) >= 2:
+                break
+            if base_caso["id"] not in ids_existentes:
+                humo_normalizado.append(base_caso)
+
     casos_normalizados = {
-        "humo": _normalizar_lista_casos(casos_dict.get("humo"), "SMK"),
+        "humo": humo_normalizado,
         "funcionales": _normalizar_lista_casos(casos_dict.get("funcionales"), "FNC"),
         "regresion": _normalizar_lista_casos(casos_dict.get("regresion"), "REG"),
         "automatizacion": _normalizar_lista_casos(

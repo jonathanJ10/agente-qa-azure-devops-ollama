@@ -2,29 +2,41 @@ import hashlib
 import json
 from pathlib import Path
 
+CACHE_SCHEMA_VERSION = "v2.1"
+
 
 def calcular_clave_cache(
-    contenido_req: str, contexto_rag: str, modelo: str
+    contenido_req: str,
+    contexto_rag: str,
+    modelo: str,
+    version_esquema: str = CACHE_SCHEMA_VERSION,
 ) -> str:
-    """Genera un hash SHA-256 único según requerimiento, contexto RAG y modelo."""
-    payload = f"{modelo}\n---\n{contexto_rag}\n---\n{contenido_req}"
-    return hashlib.sha256(payload.encode("utf-8")).hexdigest()
+    """Genera un hash SHA-256 incluyendo la versión de esquema para evitar caché obsoleta."""
+    carga = json.dumps(
+        {
+            "schema_version": version_esquema,
+            "modelo": str(modelo or "").strip(),
+            "contenido_req": str(contenido_req or ""),
+            "contexto_rag": str(contexto_rag or ""),
+        },
+        ensure_ascii=False,
+        sort_keys=True,
+    )
+    return hashlib.sha256(carga.encode("utf-8")).hexdigest()
 
 
 def leer_cache_qa(carpeta_cache: Path, clave: str) -> dict | None:
-    """Devuelve los datos cacheados si existen y son un JSON válido."""
     ruta = carpeta_cache / f"{clave}.json"
     if not ruta.exists():
         return None
     try:
-        datos = json.loads(ruta.read_text(encoding="utf-8"))
-        return datos if isinstance(datos, dict) else None
+        data = json.loads(ruta.read_text(encoding="utf-8"))
+        return data if isinstance(data, dict) else None
     except Exception:
         return None
 
 
 def guardar_cache_qa(carpeta_cache: Path, clave: str, datos: dict) -> Path:
-    """Guarda el resultado estructurado en caché."""
     carpeta_cache.mkdir(parents=True, exist_ok=True)
     ruta = carpeta_cache / f"{clave}.json"
     ruta.write_text(
