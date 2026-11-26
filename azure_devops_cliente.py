@@ -28,6 +28,21 @@ def limpiar_html(texto_html: str) -> str:
     return "\n".join(linea for linea in lineas if linea)
 
 
+def _escapar_wiql(valor: str) -> str:
+    return (valor or "").replace("'", "''")
+
+
+def _formatear_error_http(exc: urllib.error.HTTPError) -> str:
+    detalle = ""
+    try:
+        cuerpo = exc.read().decode("utf-8", errors="ignore").strip()
+        if cuerpo:
+            detalle = f" - {cuerpo[:200]}"
+    except Exception:
+        detalle = ""
+    return f"HTTP {exc.code} {exc.reason}{detalle}"
+
+
 def formatear_work_item(item: dict) -> str:
     descripcion_limpia = limpiar_html(item.get("descripcion", ""))
     criterios_limpios = limpiar_html(item.get("criterios_aceptacion", ""))
@@ -57,14 +72,16 @@ class AzureDevOpsCliente:
 
     def listar_ids_work_items(self, top: int = 10) -> list[int]:
         limite = max(1, int(top))
+        proyecto_url = urllib.parse.quote(str(settings.project), safe="")
+        proyecto_wiql = _escapar_wiql(str(settings.project))
         url = (
-            f"{settings.base_url}/{settings.project}/_apis/wit/wiql"
+            f"{settings.base_url}/{proyecto_url}/_apis/wit/wiql"
             f"?$top={limite}&api-version={settings.api_version}"
         )
         consulta = {
             "query": (
                 f"SELECT [System.Id] FROM WorkItems "
-                f"WHERE [System.TeamProject] = '{settings.project}' "
+                f"WHERE [System.TeamProject] = '{proyecto_wiql}' "
                 f"ORDER BY [System.ChangedDate] DESC"
             ),
         }
@@ -77,12 +94,15 @@ class AzureDevOpsCliente:
         try:
             with urllib.request.urlopen(req, timeout=self.timeout) as resp:
                 datos = json.loads(resp.read().decode("utf-8"))
-        except (urllib.error.HTTPError, urllib.error.URLError, TimeoutError) as exc:
+        except urllib.error.HTTPError as exc:
+            print(f"[Azure DevOps] Error listando Work Items: {_formatear_error_http(exc)}")
+            return []
+        except (urllib.error.URLError, TimeoutError) as exc:
             print(f"[Azure DevOps] Error listando Work Items: {exc}")
             return []
 
         items = datos.get("workItems", [])[:limite]
-        return [item["id"] for item in items if "id" in item]
+        return [int(item["id"]) for item in items if "id" in item]
 
     def obtener_work_items(self, ids: list[int]) -> list[dict]:
         if not ids:
@@ -98,6 +118,7 @@ class AzureDevOpsCliente:
             "Microsoft.VSTS.Common.AcceptanceCriteria",
         ]
         campos_str = urllib.parse.quote(",".join(campos))
+        proyecto_url = urllib.parse.quote(str(settings.project), safe="")
         resultado: list[dict] = []
         tamano_lote = 100
 
@@ -105,7 +126,7 @@ class AzureDevOpsCliente:
             lote = ids_unicos[inicio : inicio + tamano_lote]
             ids_str = ",".join(map(str, lote))
             url = (
-                f"{settings.base_url}/{settings.project}/_apis/wit/workitems"
+                f"{settings.base_url}/{proyecto_url}/_apis/wit/workitems"
                 f"?ids={ids_str}&fields={campos_str}&api-version={settings.api_version}"
             )
             req = urllib.request.Request(
@@ -116,7 +137,12 @@ class AzureDevOpsCliente:
             try:
                 with urllib.request.urlopen(req, timeout=self.timeout) as resp:
                     datos = json.loads(resp.read().decode("utf-8"))
-            except (urllib.error.HTTPError, urllib.error.URLError, TimeoutError) as exc:
+            except urllib.error.HTTPError as exc:
+                print(
+                    f"[Azure DevOps] Error obteniendo Work Items {lote}: {_formatear_error_http(exc)}"
+                )
+                continue
+            except (urllib.error.URLError, TimeoutError) as exc:
                 print(f"[Azure DevOps] Error obteniendo Work Items {lote}: {exc}")
                 continue
 

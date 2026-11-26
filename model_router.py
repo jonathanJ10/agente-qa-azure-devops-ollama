@@ -7,15 +7,22 @@ def seleccionar_modelo_qa(
     modelo_base: str = "llama3",
     modelo_rapido: str | None = None,
     modelo_complejo: str | None = None,
+    umbral_subopciones_complejo: int = 10,
+    umbral_chars_complejo: int = 6000,
 ) -> tuple[str, str]:
     """Selecciona el modelo de Ollama según la complejidad del requerimiento.
 
     Retorna una tupla: (modelo_elegido, motivo_enrutamiento).
     """
-    longitud = len(contenido_req or "")
-    multiples_items = len(re.findall(r"\n\s*---\s*\n", contenido_req or "")) >= 1
+    texto = contenido_req or ""
+    longitud = len(texto)
+    multiples_items = len(re.findall(r"\n\s*---\s*\n", texto)) >= 1
 
-    if cantidad_subopciones >= 10 or longitud >= 6000 or multiples_items:
+    if (
+        cantidad_subopciones >= umbral_subopciones_complejo
+        or longitud >= umbral_chars_complejo
+        or multiples_items
+    ):
         elegido = modelo_complejo or modelo_base
         motivo = (
             f"alta complejidad (subopciones={cantidad_subopciones}, "
@@ -23,9 +30,9 @@ def seleccionar_modelo_qa(
         )
         return elegido, motivo
 
-    if modelo_rapido and longitud < 1800 and cantidad_subopciones <= 3:
+    if modelo_rapido and longitud < 2500 and cantidad_subopciones <= 4 and not multiples_items:
         motivo = (
-            f"requerimiento corto (subopciones={cantidad_subopciones}, "
+            f"requerimiento corto/moderado (subopciones={cantidad_subopciones}, "
             f"chars={longitud})"
         )
         return modelo_rapido, motivo

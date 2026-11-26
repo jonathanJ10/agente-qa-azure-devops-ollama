@@ -10,6 +10,45 @@ def _a_lista_strings(valor: object) -> list[str]:
     return []
 
 
+def _formatear_criterio_gherkin(criterio: str, titulo_hu: str) -> str:
+    """Garantiza que un criterio de aceptación contenga estructura Dado/Cuando/Entonces."""
+    limpio = criterio.strip()
+    baja = limpio.lower()
+    tiene_dado = "dado" in baja
+    tiene_cuando = "cuando" in baja
+    tiene_entonces = "entonces" in baja
+
+    if tiene_dado and tiene_cuando and tiene_entonces:
+        return limpio
+
+    contexto = f"el contexto de '{titulo_hu}'" if titulo_hu else "las condiciones previas del flujo"
+    if not tiene_dado and not tiene_cuando and not tiene_entonces:
+        return (
+            f"Dado {contexto}, cuando se evalúa '{limpio}', "
+            f"entonces el sistema cumple la condición esperada de forma trazable."
+        )
+
+    partes: list[str] = []
+    if not tiene_dado:
+        partes.append(f"Dado {contexto}")
+    partes.append(limpio)
+    if not tiene_cuando:
+        partes.append("cuando se ejecuta la acción correspondiente")
+    if not tiene_entonces:
+        partes.append("entonces el sistema valida y registra el resultado esperado")
+    return ", ".join(partes) + ("." if not limpio.endswith(".") else "")
+
+
+def _asegurar_criterios_gherkin(criterios: list[str], titulo_hu: str) -> list[str]:
+    if not criterios:
+        base_titulo = titulo_hu or "el flujo solicitado"
+        return [
+            f"Dado un usuario autorizado en {base_titulo}, cuando ejecuta el flujo con datos válidos, entonces el sistema procesa la operación y registra trazabilidad.",
+            f"Dado datos inválidos o fuera de regla en {base_titulo}, cuando intenta procesar la operación, entonces el sistema rechaza la solicitud de forma controlada.",
+        ]
+    return [_formatear_criterio_gherkin(c, titulo_hu) for c in criterios]
+
+
 def _completar_cobertura_istqb_funcional(funcionales: list[dict]) -> list[dict]:
     """Completa de forma determinista huecos ISTQB críticos sin alterar casos existentes."""
     salida = list(funcionales)
@@ -140,7 +179,8 @@ def normalizar_y_validar_qa(datos: dict | None) -> dict:
             hu.get("descripcion")
             or "Como usuario del sistema, quiero ejecutar el flujo requerido, para cumplir el objetivo del negocio."
         ).strip()
-        criterios = _a_lista_strings(hu.get("criterios_aceptacion"))
+        criterios_raw = _a_lista_strings(hu.get("criterios_aceptacion"))
+        criterios = _asegurar_criterios_gherkin(criterios_raw, titulo)
         historias_normalizadas.append(
             {
                 "id": hu_id,
